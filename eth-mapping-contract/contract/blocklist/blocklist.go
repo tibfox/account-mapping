@@ -26,7 +26,7 @@ type SeedBlocksParams struct {
 	BlockHeight uint32 `json:"block_height"`
 }
 
-const LastHeightKey = "lsthgt"
+const LastHeightKey = "h"
 
 var ErrorLastHeightDNE = errors.New("last height does not exist")
 
