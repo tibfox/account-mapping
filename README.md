@@ -1,43 +1,78 @@
 # Account Mapping Contracts
 
-TinyGo WASM smart contracts that bridge account-based blockchains to the VSC/Magi network.
+TinyGo WASM smart contracts that bridge account-based blockchains (EVM and ERC-20 compatible) to the VSC/Magi network.
 
-Unlike the [UTXO mapping contracts](https://github.com/vsc-eco/utxo-mapping) which verify deposits via SPV merkle proofs, account-based chains use oracle-submitted deposits — an authorized oracle calls `map` with deposit details.
+Companion to [vsc-eco/utxo-mapping](https://github.com/vsc-eco/utxo-mapping), which covers UTXO-based chains (BTC, LTC, DASH, DOGE, BCH).
 
 ## Supported Chains
 
-| Chain | Status | Tests |
-|-------|--------|-------|
-| ETH   | Partial — token ops work, Map/Unmap not implemented | 43 |
+| Contract | Chain(s) | Asset |
+|----------|----------|-------|
+| `evm-mapping-contract` | Ethereum + any EVM L2 (Arbitrum, Optimism, Base, …) | ETH + ERC-20 |
 
-## What Works
+Chain selection is compile-time via the `NetworkMode` ldflag and runtime via `setChainId`.
 
-- `transfer` / `transferFrom` — move mapped tokens between VSC addresses
-- `approve` / `increaseAllowance` / `decreaseAllowance` — ERC-20 style allowances
-- Address validation via `sdk.VerifyAddress()`
+## How It Works
 
-## What's Missing
+The contract verifies on-chain deposit proofs (receipt-trie inclusion against a stored block header) and credits the depositor's VSC account with a wrapped token balance. Withdrawals (unmapping) construct and TSS-sign an EVM transaction, returning funds to the user's external address.
 
-- `map` — stub, no oracle deposit submission flow
-- `unmap` — not implemented (ETH withdrawals need a different approach than UTXO tx construction)
-- No mapping bot chain adapter
-- No DEX integration tested
-- No block header or receipt proof validation
+## Contract Actions
 
-## Future Chains
+**Deposit & transfer:**
+- `map` — process an incoming deposit with a receipt-trie proof
+- `transfer` / `transferFrom` / `approve` / `increaseAllowance` / `decreaseAllowance` — ERC-20-style balance operations on mapped tokens
+- `confirmSpend` — finalize a pending unmap after its tx confirms on-chain
 
-This repo is where Solana, Avalanche, Polygon, Arbitrum, and other account-based chains would go.
+**Withdrawal:**
+- `unmapETH` — withdraw native ETH to an external address
+- `unmapERC20` — withdraw a registered ERC-20 token
+- `unmapFrom` — withdraw on behalf of a third party via allowance
+- `replaceWithdrawal` — replace a stuck withdrawal tx (e.g. for fee bump)
+- `clearNonce` — reset the contract's EVM nonce tracker after an on-chain rollback
 
-## Building
+**Chain relay:**
+- `addBlocks` — oracle appends new EVM block headers
+- `replaceBlock` — replace the tip header after a reorg
 
-```bash
-cd eth-mapping-contract
-USE_DOCKER=1 make dev
+**Admin / owner:**
+- `registerPublicKey` — register TSS primary + backup keys
+- `registerRouter` — register the DEX router contract
+- `registerToken` — whitelist an ERC-20 contract
+- `setVault` — set the 20-byte EVM vault address holding mapped funds
+- `setChainId` — set the EIP-155 chain ID
+- `setGasReserve` — set the gas buffer retained for withdrawal txs
+- `adminMint` — emergency mint (owner-only)
+
+## Repo Layout
+
+```
+evm-mapping-contract/
+├── Makefile                 # TinyGo build targets (dev/testnet/mainnet/…)
+├── go.mod, go.sum
+├── contract/                # on-chain logic
+│   ├── main.go              # wasmexport entry points
+│   ├── blocklist/           # EVM block header relay + reorg
+│   ├── mapping/             # deposit/withdrawal flow
+│   ├── crypto/              # keccak, RLP, receipt decoding
+│   ├── constants/
+│   └── contracterrors/
+├── monitor/                 # off-chain helpers (scanner, receipt encoding)
+├── sdk/                     # VSC WASM runtime bindings
+└── runtime/                 # TinyGo GC shim (leaking allocator)
 ```
 
-## Testing
+## Build
 
 ```bash
-cd eth-mapping-contract
-make test
+cd evm-mapping-contract
+USE_DOCKER=1 make testnet   # -> bin/testnet.wasm
+USE_DOCKER=1 make mainnet   # -> bin/mainnet.wasm
+USE_DOCKER=1 make dev       # -> bin/dev.wasm (regtest)
+make test                   # Go tests (no TinyGo)
 ```
+
+Docker is recommended because TinyGo 0.39 requires Go 1.19–1.25 and most dev boxes run newer Go.
+
+## License
+
+See upstream at [vsc-eco/utxo-mapping](https://github.com/vsc-eco/utxo-mapping) — same license applies.

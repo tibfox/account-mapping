@@ -1,0 +1,712 @@
+package mapping
+
+import (
+	"encoding/hex"
+	"errors"
+	"evm-mapping-contract/contract/blocklist"
+	"evm-mapping-contract/contract/constants"
+	"evm-mapping-contract/contract/crypto"
+	"evm-mapping-contract/contract/mpt"
+	"evm-mapping-contract/contract/rlp"
+	"evm-mapping-contract/sdk"
+	"math/big"
+	"strconv"
+)
+
+func HandleMap(params *MapParams, vaultAddress [20]byte) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	if vaultAddress == ([20]byte{}) {
+		return errors.New("vault address not configured")
+	}
+
+	req := &params.TxData
+
+	switch req.DepositType {
+	case "eth":
+		sender, amountBytes, _, err := VerifyETHDeposit(req, vaultAddress)
+		if err != nil {
+			return err
+		}
+
+		amount := new(big.Int).SetBytes(amountBytes)
+		if amount.Sign() <= 0 {
+			return errors.New("deposit amount must be positive")
+		}
+		if !amount.IsInt64() || amount.Int64() <= 0 {
+			return errors.New("deposit amount exceeds safe int64 range")
+		}
+		amountInt64 := amount.Int64()
+
+		dest := routeDeposit(sender, params.Instructions, "eth", amountInt64)
+
+		// Gas reserve tax: 1% of ETH deposits (safe division, no overflow)
+		gasTax := amountInt64 / 10000 * constants.GasReserveDepositTaxBps
+		if gasTax > 0 {
+			addGasReserve(gasTax)
+			amountInt64 -= gasTax
+		}
+
+		if dest != "" {
+			IncBalance(dest, "eth", amountInt64)
+		}
+		TrackDeposit("eth", amountInt64, gasTax)
+		return nil
+
+	case "erc20":
+		tokenAddr, err := crypto.HexToAddress(req.TokenAddress)
+		if err != nil {
+			return errors.New("invalid token address")
+		}
+
+		tokenInfo := getTokenInfo(tokenAddr)
+		if tokenInfo == nil {
+			return ErrInvalidToken
+		}
+
+		sender, amountBytes, _, err := VerifyERC20Deposit(req, vaultAddress, tokenAddr)
+		if err != nil {
+			return err
+		}
+
+		amount := new(big.Int).SetBytes(amountBytes)
+		if amount.Sign() <= 0 || !amount.IsInt64() || amount.Int64() <= 0 {
+			return errors.New("deposit amount invalid or exceeds safe range")
+		}
+		amountInt64 := amount.Int64()
+
+		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amountInt64)
+		if dest != "" {
+			IncBalance(dest, tokenInfo.Symbol, amountInt64)
+		}
+		TrackDeposit(tokenInfo.Symbol, amountInt64, 0)
+		return nil
+
+	default:
+		return errors.New("deposit_type must be 'eth' or 'erc20'")
+	}
+}
+
+func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint64) (string, error) {
+	if isPaused() {
+		return "", errors.New("contract is paused")
+	}
+	if HasPendingWithdrawal() {
+		return "", errors.New("withdrawal pending: wait for confirmation")
+	}
+
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return "", errors.New("invalid amount")
+	}
+	if amount < constants.MinETHWithdrawal {
+		return "", errors.New("below minimum ETH withdrawal")
+	}
+
+	toAddr, err := crypto.HexToAddress(params.To)
+	if err != nil {
+		return "", errors.New("invalid 'to' address")
+	}
+
+	header := blocklist.GetHeader(blocklist.GetLastHeight())
+	if header == nil {
+		return "", errors.New("no block headers available")
+	}
+
+	gasReserve := getGasReserve()
+	if gasReserve < constants.MinGasReserve {
+		return "", errors.New("insufficient gas reserve")
+	}
+
+	gasTipCap := uint64(2_000_000_000)                  // 2 gwei
+	gasFeeCap := header.BaseFeePerGas*2 + gasTipCap
+	fee := int64(constants.ETHTransferGas * gasFeeCap)
+
+	if params.MaxFee != "" {
+		maxFee, _ := strconv.ParseInt(params.MaxFee, 10, 64)
+		if maxFee > 0 && fee > maxFee {
+			return "", errors.New("fee exceeds max_fee")
+		}
+	}
+
+	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds
+	totalDeduct := amount + fee
+	if params.DeductFee {
+		totalDeduct = amount
+	}
+	if GetBalance(caller, "eth") < totalDeduct {
+		return "", errors.New("insufficient balance")
+	}
+
+	nonce := GetPendingNonce()
+	amountBig := new(big.Int).SetInt64(amount)
+	unsigned := BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amountBig)
+	sighash := ComputeSighash(unsigned)
+
+	if err := requireTssKey(); err != nil {
+		return "", err
+	}
+	sdk.TssSignKey("primary", sighash)
+
+	if !DecBalance(caller, "eth", totalDeduct) {
+		return "", errors.New("insufficient balance")
+	}
+	TrackWithdrawal("eth", amount)
+
+	// Store pending spend
+	StorePendingSpend(PendingSpend{
+		Nonce:       nonce,
+		Amount:      amount,
+		From:        caller,
+		To:          params.To,
+		Asset:       "eth",
+		UnsignedTxHex: hex.EncodeToString(unsigned),
+		BlockHeight: blocklist.GetLastHeight(),
+	})
+	SetPendingNonce(nonce + 1)
+
+	return hex.EncodeToString(unsigned), nil
+}
+
+func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uint64) (string, error) {
+	if isPaused() {
+		return "", errors.New("contract is paused")
+	}
+	if HasPendingWithdrawal() {
+		return "", errors.New("withdrawal pending: wait for confirmation")
+	}
+
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return "", errors.New("invalid amount")
+	}
+	if params.TokenAddress == "" {
+		return "", errors.New("token_address required for ERC-20 withdrawal")
+	}
+	tokenAddr, err := crypto.HexToAddress(params.TokenAddress)
+	if err != nil {
+		return "", errors.New("invalid token_address")
+	}
+	tokenInfo := getTokenInfo(tokenAddr)
+	if tokenInfo == nil {
+		return "", ErrInvalidToken
+	}
+	if amount < tokenInfo.MinWithdrawal {
+		return "", errors.New("below minimum withdrawal for this token")
+	}
+
+	recipientAddr, err := crypto.HexToAddress(params.To)
+	if err != nil {
+		return "", errors.New("invalid recipient address")
+	}
+
+	header := blocklist.GetHeader(blocklist.GetLastHeight())
+	if header == nil {
+		return "", errors.New("no block headers available")
+	}
+
+	gasReserve := getGasReserve()
+	if gasReserve < constants.MinGasReserve {
+		return "", errors.New("insufficient gas reserve for ERC-20 withdrawal")
+	}
+
+	gasTipCap := uint64(2_000_000_000)
+	gasFeeCap := header.BaseFeePerGas*2 + gasTipCap
+	gasCost := int64(constants.ERC20TransferGas * gasFeeCap)
+
+	nonce := GetPendingNonce()
+	amountBig := new(big.Int).SetInt64(amount)
+	unsigned := BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, recipientAddr, amountBig)
+	sighash := ComputeSighash(unsigned)
+
+	if err := requireTssKey(); err != nil {
+		return "", err
+	}
+	sdk.TssSignKey("primary", sighash)
+
+	if !DecBalance(caller, tokenInfo.Symbol, amount) {
+		return "", errors.New("insufficient token balance")
+	}
+	TrackWithdrawal(tokenInfo.Symbol, amount)
+
+	deductGasReserve(gasCost)
+
+	StorePendingSpend(PendingSpend{
+		Nonce:        nonce,
+		Amount:       amount,
+		From:         caller,
+		To:           params.To,
+		Asset:        tokenInfo.Symbol,
+		TokenAddress: params.TokenAddress,
+		UnsignedTxHex:  hex.EncodeToString(unsigned),
+		BlockHeight:  blocklist.GetLastHeight(),
+	})
+	SetPendingNonce(nonce + 1)
+
+	return hex.EncodeToString(unsigned), nil
+}
+
+func HandleConfirmSpend(req *VerificationRequest, vaultAddress [20]byte) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+
+	confirmedNonce := GetConfirmedNonce()
+	ps := GetPendingSpend(confirmedNonce)
+	if ps == nil {
+		return errors.New("no pending spend at confirmed nonce")
+	}
+
+	// Block must be after the withdrawal was created
+	if req.BlockHeight <= ps.BlockHeight {
+		return errors.New("confirmation block must be after withdrawal block")
+	}
+
+	header := blocklist.GetHeader(req.BlockHeight)
+	if header == nil {
+		return ErrBlockNotFound
+	}
+
+	receiptBytes, err := hex.DecodeString(req.RawHex)
+	if err != nil {
+		return errors.New("invalid receipt hex")
+	}
+
+	proofBytes, err := hex.DecodeString(req.MerkleProofHex)
+	if err != nil {
+		return errors.New("invalid proof hex")
+	}
+
+	proof := splitProofNodes(proofBytes)
+	key := rlp.EncodeUint64(req.TxIndex)
+	provenValue, err := mpt.VerifyProof(header.ReceiptsRoot, key, proof)
+	if err != nil {
+		return ErrProofFailed
+	}
+
+	// Strip EIP-2718 type prefix for receipt parsing
+	receiptToParse := receiptBytes
+	if len(receiptToParse) > 0 && receiptToParse[0] <= 0x7f {
+		receiptToParse = receiptToParse[1:]
+	}
+	provenToParse := provenValue
+	if len(provenToParse) > 0 && provenToParse[0] <= 0x7f {
+		provenToParse = provenToParse[1:]
+	}
+
+	// Verify proven value matches submitted receipt (after type stripping for comparison)
+	if !bytesEqual(provenValue, receiptBytes) {
+		return errors.New("receipt does not match proof")
+	}
+
+	// Parse receipt status
+	items, err := rlp.DecodeList(receiptToParse)
+	if err != nil || len(items) < 1 {
+		return errors.New("invalid receipt RLP")
+	}
+	status := items[0].AsUint64()
+
+	if status == 1 {
+		// Success — withdrawal completed on L1, supply already deducted at unmap time
+		DeletePendingSpend(confirmedNonce)
+		SetConfirmedNonce(confirmedNonce + 1)
+	} else {
+		// Failed — refund user, reverse supply tracking
+		IncBalance(ps.From, ps.Asset, ps.Amount)
+		s := GetSupply(ps.Asset)
+		s.Active += ps.Amount
+		s.User += ps.Amount
+		SetSupply(ps.Asset, s)
+		DeletePendingSpend(confirmedNonce)
+		SetConfirmedNonce(confirmedNonce + 1)
+	}
+
+	return nil
+}
+
+func HandleTransfer(params *TransferParams) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return errors.New("invalid amount")
+	}
+
+	if !DecBalance(caller, params.Asset, amount) {
+		return errors.New("insufficient balance")
+	}
+	IncBalance(params.To, params.Asset, amount)
+	return nil
+}
+
+func HandleTransferFrom(params *TransferParams) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return errors.New("invalid amount")
+	}
+
+	allowance := GetAllowance(params.From, caller, params.Asset)
+	if allowance < amount {
+		return errors.New("insufficient allowance")
+	}
+
+	if !DecBalance(params.From, params.Asset, amount) {
+		return errors.New("insufficient balance")
+	}
+	SetAllowance(params.From, caller, params.Asset, allowance-amount)
+	IncBalance(params.To, params.Asset, amount)
+	return nil
+}
+
+func HandleApprove(params *AllowanceParams) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount < 0 {
+		return errors.New("invalid amount")
+	}
+
+	SetAllowance(caller, params.Spender, params.Asset, amount)
+	return nil
+}
+
+// Helpers
+
+func routeDeposit(sender [20]byte, instructions []string, asset string, amount int64) string {
+	did := crypto.AddressToDID(sender, 1)
+	dest := did
+	var swapTo, assetOut, destChain string
+
+	for _, instr := range instructions {
+		if len(instr) > 11 && instr[:11] == "deposit_to=" {
+			dest = instr[11:]
+		}
+		if len(instr) > 8 && instr[:8] == "swap_to=" {
+			swapTo = instr[8:]
+		}
+		if len(instr) > 10 && instr[:10] == "asset_out=" {
+			assetOut = instr[10:]
+		}
+		if len(instr) > 18 && instr[:18] == "destination_chain=" {
+			destChain = instr[18:]
+		}
+	}
+
+	if swapTo != "" && assetOut != "" {
+		routerIdPtr := sdk.StateGetObject(constants.RouterContractIdKey)
+		if routerIdPtr == nil || *routerIdPtr == "" {
+			return dest
+		}
+		routerId := *routerIdPtr
+		env := sdk.GetEnv()
+		selfAddr := "contract:" + env.ContractId
+
+		IncBalance(selfAddr, asset, amount)
+		SetAllowance(selfAddr, "contract:"+routerId, asset, amount)
+
+		instrJSON := `{"type":"swap","version":"1.0.0","asset_in":"` + asset +
+			`","amount_in":"` + strconv.FormatInt(amount, 10) +
+			`","asset_out":"` + assetOut +
+			`","recipient":"` + swapTo +
+			`","destination_chain":"` + destChain + `"}`
+
+		result := sdk.ContractCall(routerId, "execute", instrJSON, nil)
+		SetAllowance(selfAddr, "contract:"+routerId, asset, 0)
+
+		if result == nil {
+			// Router call failed. Reverse the self-balance credit and fall through
+			// to credit the depositor directly with the original asset.
+			DecBalance(selfAddr, asset, amount)
+			return dest
+		}
+		return ""
+	}
+
+	return dest
+}
+
+func isPaused() bool {
+	data := sdk.StateGetObject(constants.PausedKey)
+	return data != nil && *data == "1"
+}
+
+func getTokenInfo(addr [20]byte) *TokenInfo {
+	key := constants.TokenRegistryPrefix + hex.EncodeToString(addr[:])
+	data := sdk.StateGetObject(key)
+	if data == nil {
+		return nil
+	}
+	// Format: symbol|decimals|minWithdrawal
+	fields := splitPipe(*data)
+	if len(fields) < 2 {
+		return nil
+	}
+	dec, _ := strconv.ParseUint(fields[1], 10, 8)
+	info := &TokenInfo{Symbol: fields[0], Decimals: uint8(dec)}
+	if len(fields) >= 3 {
+		info.MinWithdrawal, _ = strconv.ParseInt(fields[2], 10, 64)
+	}
+	if info.MinWithdrawal <= 0 {
+		info.MinWithdrawal = constants.MinUSDCWithdrawal
+	}
+	return info
+}
+
+func RegisterToken(addr [20]byte, symbol string, decimals uint8, minWithdrawal int64) {
+	key := constants.TokenRegistryPrefix + hex.EncodeToString(addr[:])
+	sdk.StateSetObject(key, symbol+"|"+strconv.FormatUint(uint64(decimals), 10)+"|"+strconv.FormatInt(minWithdrawal, 10))
+}
+
+func requireTssKey() error {
+	keyInfo := sdk.TssGetKey("primary")
+	if keyInfo == "" || keyInfo == "fail" {
+		return errors.New("TSS key not available")
+	}
+	return nil
+}
+
+func getGasReserve() int64 {
+	data := sdk.StateGetObject(constants.GasReserveKey)
+	if data == nil {
+		return 0
+	}
+	v, _ := strconv.ParseInt(*data, 10, 64)
+	return v
+}
+
+func addGasReserve(amount int64) {
+	current := getGasReserve()
+	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(current+amount, 10))
+}
+
+func deductGasReserve(amount int64) {
+	current := getGasReserve()
+	newVal := current - amount
+	if newVal < 0 {
+		newVal = 0
+	}
+	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(newVal, 10))
+}
+
+
+func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint64) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	if HasPendingWithdrawal() {
+		return errors.New("withdrawal pending: wait for confirmation")
+	}
+
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return errors.New("invalid amount")
+	}
+	if params.Asset == "eth" && amount < constants.MinETHWithdrawal {
+		return errors.New("below minimum ETH withdrawal")
+	}
+
+	if err := requireTssKey(); err != nil {
+		return err
+	}
+
+	// Validate ALL inputs BEFORE any state mutations
+	toAddr, err := crypto.HexToAddress(params.To)
+	if err != nil {
+		return errors.New("invalid destination address")
+	}
+
+	header := blocklist.GetHeader(blocklist.GetLastHeight())
+	if header == nil {
+		return errors.New("no block headers available")
+	}
+
+	var tokenAddr [20]byte
+	if params.Asset != "eth" {
+		if params.TokenAddress == "" {
+			return errors.New("token_address required")
+		}
+		tokenAddr, err = crypto.HexToAddress(params.TokenAddress)
+		if err != nil {
+			return errors.New("invalid token_address")
+		}
+		tokenInfo := getTokenInfo(tokenAddr)
+		if tokenInfo == nil {
+			return ErrInvalidToken
+		}
+		if amount < tokenInfo.MinWithdrawal {
+			return errors.New("below minimum withdrawal for this token")
+		}
+		if getGasReserve() < constants.MinGasReserve {
+			return errors.New("insufficient gas reserve for ERC-20 withdrawal")
+		}
+	}
+
+	allowance := GetAllowance(params.From, caller, params.Asset)
+	if allowance < amount {
+		return errors.New("insufficient allowance")
+	}
+
+	// All validation passed — now mutate state
+	if !DecBalance(params.From, params.Asset, amount) {
+		return errors.New("insufficient balance in owner account")
+	}
+	SetAllowance(params.From, caller, params.Asset, allowance-amount)
+	TrackWithdrawal(params.Asset, amount)
+
+	gasTipCap := uint64(2_000_000_000)
+	gasFeeCap := header.BaseFeePerGas*2 + gasTipCap
+	nonce := GetPendingNonce()
+	amountBig := new(big.Int).SetInt64(amount)
+
+	var unsigned []byte
+	var asset string
+	var tokenAddress string
+	if params.Asset == "eth" {
+		unsigned = BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amountBig)
+		asset = "eth"
+	} else {
+		unsigned = BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
+		asset = params.Asset
+		tokenAddress = params.TokenAddress
+		deductGasReserve(int64(constants.ERC20TransferGas * gasFeeCap))
+	}
+
+	sighash := ComputeSighash(unsigned)
+	sdk.TssSignKey("primary", sighash)
+
+	StorePendingSpend(PendingSpend{
+		Nonce:        nonce,
+		Amount:       amount,
+		From:         params.From,
+		To:           params.To,
+		Asset:        asset,
+		TokenAddress: tokenAddress,
+		UnsignedTxHex:  hex.EncodeToString(unsigned),
+		BlockHeight:  blocklist.GetLastHeight(),
+	})
+	SetPendingNonce(nonce + 1)
+	return nil
+}
+
+func HandleIncreaseAllowance(params *AllowanceParams) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return errors.New("invalid amount")
+	}
+
+	current := GetAllowance(caller, params.Spender, params.Asset)
+	SetAllowance(caller, params.Spender, params.Asset, current+amount)
+	return nil
+}
+
+func HandleDecreaseAllowance(params *AllowanceParams) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+
+	amount, err := strconv.ParseInt(params.Amount, 10, 64)
+	if err != nil || amount <= 0 {
+		return errors.New("invalid amount")
+	}
+
+	current := GetAllowance(caller, params.Spender, params.Asset)
+	newVal := current - amount
+	if newVal < 0 {
+		newVal = 0
+	}
+	SetAllowance(caller, params.Spender, params.Asset, newVal)
+	return nil
+}
+
+func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) {
+	confirmedNonce := GetConfirmedNonce()
+	ps := GetPendingSpend(confirmedNonce)
+	if ps == nil {
+		sdk.Revert("no pending withdrawal to replace", "replaceWithdrawal")
+		return
+	}
+
+	// Rebuild with 2x gas
+	header := blocklist.GetHeader(blocklist.GetLastHeight())
+	if header == nil {
+		sdk.Revert("no headers", "replaceWithdrawal")
+		return
+	}
+
+	gasTipCap := uint64(4_000_000_000) // doubled
+	gasFeeCap := header.BaseFeePerGas*3 + gasTipCap
+
+	toAddr, _ := crypto.HexToAddress(ps.To)
+	amountBig := new(big.Int).SetInt64(ps.Amount)
+
+	var unsigned []byte
+	if ps.Asset == "eth" {
+		unsigned = BuildETHWithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, toAddr, amountBig)
+	} else {
+		tokenAddr, _ := crypto.HexToAddress(ps.TokenAddress)
+		unsigned = BuildERC20WithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
+	}
+
+	sighash := ComputeSighash(unsigned)
+	sdk.TssSignKey("primary", sighash)
+
+	// Update pending spend with new signed TX
+	ps.UnsignedTxHex = hex.EncodeToString(unsigned)
+	StorePendingSpend(*ps)
+}
+
+func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
+	confirmedNonce := GetConfirmedNonce()
+	ps := GetPendingSpend(confirmedNonce)
+	if ps == nil {
+		sdk.Revert("no pending nonce to clear", "clearNonce")
+		return
+	}
+
+	// Build 0-value self-transfer to advance nonce
+	unsigned := BuildETHWithdrawalTx(chainId, confirmedNonce, 4_000_000_000, 100_000_000_000, vaultAddress, big.NewInt(0))
+	sighash := ComputeSighash(unsigned)
+	sdk.TssSignKey("primary", sighash)
+
+	// Refund the user and reverse supply
+	IncBalance(ps.From, ps.Asset, ps.Amount)
+	sup := GetSupply(ps.Asset)
+	sup.Active += ps.Amount
+	sup.User += ps.Amount
+	SetSupply(ps.Asset, sup)
+	DeletePendingSpend(confirmedNonce)
+	SetConfirmedNonce(confirmedNonce + 1)
+	SetPendingNonce(confirmedNonce + 1)
+}
