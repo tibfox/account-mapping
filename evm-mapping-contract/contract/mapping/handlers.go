@@ -2,6 +2,7 @@ package mapping
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"evm-mapping-contract/contract/blocklist"
 	"evm-mapping-contract/contract/constants"
@@ -42,14 +43,16 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 		dest := routeDeposit(sender, params.Instructions, "eth", amountInt64)
 
 		// Gas reserve tax: 1% of ETH deposits (safe division, no overflow)
-		gasTax := amountInt64 / 10000 * constants.GasReserveDepositTaxBps
+		gasTax := amountInt64 * constants.GasReserveDepositTaxBps / 10000
 		if gasTax > 0 {
 			addGasReserve(gasTax)
 			amountInt64 -= gasTax
 		}
 
 		if dest != "" {
-			IncBalance(dest, "eth", amountInt64)
+			if err := IncBalance(dest, "eth", amountInt64); err != nil {
+				return errors.New("balance overflow")
+			}
 		}
 		TrackDeposit("eth", amountInt64, gasTax)
 		return nil
@@ -78,7 +81,9 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 
 		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amountInt64)
 		if dest != "" {
-			IncBalance(dest, tokenInfo.Symbol, amountInt64)
+			if err := IncBalance(dest, tokenInfo.Symbol, amountInt64); err != nil {
+				return errors.New("balance overflow")
+			}
 		}
 		TrackDeposit(tokenInfo.Symbol, amountInt64, 0)
 		return nil
@@ -253,7 +258,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	return hex.EncodeToString(unsigned), nil
 }
 
-func HandleConfirmSpend(req *VerificationRequest, vaultAddress [20]byte) error {
+func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte) error {
 	if isPaused() {
 		return errors.New("contract is paused")
 	}
@@ -264,7 +269,6 @@ func HandleConfirmSpend(req *VerificationRequest, vaultAddress [20]byte) error {
 		return errors.New("no pending spend at confirmed nonce")
 	}
 
-	// Block must be after the withdrawal was created
 	if req.BlockHeight <= ps.BlockHeight {
 		return errors.New("confirmation block must be after withdrawal block")
 	}
@@ -274,39 +278,71 @@ func HandleConfirmSpend(req *VerificationRequest, vaultAddress [20]byte) error {
 		return ErrBlockNotFound
 	}
 
-	receiptBytes, err := hex.DecodeString(req.RawHex)
+	// --- Transaction proof: verify the tx matches the pending spend ---
+	txBytes, err := hex.DecodeString(req.TxHex)
 	if err != nil {
-		return errors.New("invalid receipt hex")
+		return errors.New("invalid tx_hex")
+	}
+	txProofBytes, err := hex.DecodeString(req.TxProofHex)
+	if err != nil {
+		return errors.New("invalid tx_proof_hex")
 	}
 
-	proofBytes, err := hex.DecodeString(req.MerkleProofHex)
+	txProof := splitProofNodes(txProofBytes)
+	txKey := rlp.EncodeUint64(req.TxIndex)
+	provenTx, err := mpt.VerifyProof(header.TransactionsRoot, txKey, txProof)
 	if err != nil {
-		return errors.New("invalid proof hex")
+		return errors.New("tx proof verification failed")
+	}
+	if !bytesEqual(provenTx, txBytes) {
+		return errors.New("tx does not match proof")
 	}
 
-	proof := splitProofNodes(proofBytes)
-	key := rlp.EncodeUint64(req.TxIndex)
-	provenValue, err := mpt.VerifyProof(header.ReceiptsRoot, key, proof)
+	parsedTx, err := parseTransaction(txBytes)
 	if err != nil {
-		return ErrProofFailed
+		return errors.New("failed to parse proven tx: " + err.Error())
+	}
+	if parsedTx.Nonce != ps.Nonce {
+		return errors.New("tx nonce does not match pending spend")
+	}
+	psTo, err := crypto.HexToAddress(ps.To)
+	if err != nil {
+		return errors.New("invalid pending spend destination")
+	}
+	if ps.Asset == "eth" {
+		if parsedTx.To != psTo {
+			return errors.New("tx destination does not match pending spend")
+		}
+		txAmount := new(big.Int).SetBytes(parsedTx.Value)
+		if txAmount.Int64() != ps.Amount {
+			return errors.New("tx amount does not match pending spend")
+		}
 	}
 
-	// Strip EIP-2718 type prefix for receipt parsing
+	// --- Receipt proof: determine success or failure ---
+	receiptBytes, err := hex.DecodeString(req.ReceiptHex)
+	if err != nil {
+		return errors.New("invalid receipt_hex")
+	}
+	receiptProofBytes, err := hex.DecodeString(req.ReceiptProofHex)
+	if err != nil {
+		return errors.New("invalid receipt_proof_hex")
+	}
+
+	receiptProof := splitProofNodes(receiptProofBytes)
+	receiptKey := rlp.EncodeUint64(req.TxIndex)
+	provenReceipt, err := mpt.VerifyProof(header.ReceiptsRoot, receiptKey, receiptProof)
+	if err != nil {
+		return errors.New("receipt proof verification failed")
+	}
+	if !bytesEqual(provenReceipt, receiptBytes) {
+		return errors.New("receipt does not match proof")
+	}
+
 	receiptToParse := receiptBytes
 	if len(receiptToParse) > 0 && receiptToParse[0] <= 0x7f {
 		receiptToParse = receiptToParse[1:]
 	}
-	provenToParse := provenValue
-	if len(provenToParse) > 0 && provenToParse[0] <= 0x7f {
-		provenToParse = provenToParse[1:]
-	}
-
-	// Verify proven value matches submitted receipt (after type stripping for comparison)
-	if !bytesEqual(provenValue, receiptBytes) {
-		return errors.New("receipt does not match proof")
-	}
-
-	// Parse receipt status
 	items, err := rlp.DecodeList(receiptToParse)
 	if err != nil || len(items) < 1 {
 		return errors.New("invalid receipt RLP")
@@ -314,12 +350,12 @@ func HandleConfirmSpend(req *VerificationRequest, vaultAddress [20]byte) error {
 	status := items[0].AsUint64()
 
 	if status == 1 {
-		// Success — withdrawal completed on L1, supply already deducted at unmap time
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
 	} else {
-		// Failed — refund user, reverse supply tracking
-		IncBalance(ps.From, ps.Asset, ps.Amount)
+		if err := IncBalance(ps.From, ps.Asset, ps.Amount); err != nil {
+			return errors.New("refund overflow")
+		}
 		s := GetSupply(ps.Asset)
 		s.Active += ps.Amount
 		s.User += ps.Amount
@@ -346,7 +382,9 @@ func HandleTransfer(params *TransferParams) error {
 	if !DecBalance(caller, params.Asset, amount) {
 		return errors.New("insufficient balance")
 	}
-	IncBalance(params.To, params.Asset, amount)
+	if err := IncBalance(params.To, params.Asset, amount); err != nil {
+		return errors.New("recipient balance overflow")
+	}
 	return nil
 }
 
@@ -371,7 +409,9 @@ func HandleTransferFrom(params *TransferParams) error {
 		return errors.New("insufficient balance")
 	}
 	SetAllowance(params.From, caller, params.Asset, allowance-amount)
-	IncBalance(params.To, params.Asset, amount)
+	if err := IncBalance(params.To, params.Asset, amount); err != nil {
+		return errors.New("recipient balance overflow")
+	}
 	return nil
 }
 
@@ -422,16 +462,22 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount i
 		env := sdk.GetEnv()
 		selfAddr := "contract:" + env.ContractId
 
-		IncBalance(selfAddr, asset, amount)
+		if err := IncBalance(selfAddr, asset, amount); err != nil {
+			return dest
+		}
 		SetAllowance(selfAddr, "contract:"+routerId, asset, amount)
 
-		instrJSON := `{"type":"swap","version":"1.0.0","asset_in":"` + asset +
-			`","amount_in":"` + strconv.FormatInt(amount, 10) +
-			`","asset_out":"` + assetOut +
-			`","recipient":"` + swapTo +
-			`","destination_chain":"` + destChain + `"}`
+		instrJSON, _ := json.Marshal(DexInstruction{
+			Type:             "swap",
+			Version:          "1.0.0",
+			AssetIn:          asset,
+			AmountIn:         strconv.FormatInt(amount, 10),
+			AssetOut:         assetOut,
+			Recipient:        swapTo,
+			DestinationChain: destChain,
+		})
 
-		result := sdk.ContractCall(routerId, "execute", instrJSON, nil)
+		result := sdk.ContractCall(routerId, "execute", string(instrJSON), nil)
 		SetAllowance(selfAddr, "contract:"+routerId, asset, 0)
 
 		if result == nil {
@@ -625,7 +671,11 @@ func HandleIncreaseAllowance(params *AllowanceParams) error {
 	}
 
 	current := GetAllowance(caller, params.Spender, params.Asset)
-	SetAllowance(caller, params.Spender, params.Asset, current+amount)
+	newVal, err := safeAdd64(current, amount)
+	if err != nil {
+		return errors.New("allowance overflow")
+	}
+	SetAllowance(caller, params.Spender, params.Asset, newVal)
 	return nil
 }
 
@@ -700,8 +750,7 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// Refund the user and reverse supply
-	IncBalance(ps.From, ps.Asset, ps.Amount)
+	_ = IncBalance(ps.From, ps.Asset, ps.Amount)
 	sup := GetSupply(ps.Asset)
 	sup.Active += ps.Amount
 	sup.User += ps.Amount

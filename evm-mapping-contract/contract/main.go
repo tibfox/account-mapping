@@ -61,8 +61,6 @@ func addBlocks(input *string) *string {
 	if err := blocklist.HandleAddBlocks(&params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
-	currentHeight := blocklist.GetLastHeight()
-	mapping.CheckAutoExpiry(currentHeight)
 	return nil
 }
 
@@ -98,7 +96,7 @@ func unmapERC20(input *string) *string {
 
 //go:wasmexport confirmSpend
 func confirmSpend(input *string) *string {
-	var req mapping.VerificationRequest
+	var req mapping.ConfirmSpendRequest
 	json.Unmarshal([]byte(*input), &req)
 	if err := mapping.HandleConfirmSpend(&req, vault()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
@@ -189,7 +187,9 @@ func adminMint(input *string) *string {
 	if params.Amount <= 0 || params.Address == "" || params.Asset == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "address, asset, and positive amount required"))
 	}
-	mapping.IncBalance(params.Address, params.Asset, params.Amount)
+	if err := mapping.IncBalance(params.Address, params.Asset, params.Amount); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "balance overflow"))
+	}
 	return nil
 }
 
@@ -266,6 +266,20 @@ func createKey(_ *string) *string {
 func renewKey(_ *string) *string {
 	checkOwner()
 	sdk.TssCreateKey("primary", "ecdsa", 365)
+	return nil
+}
+
+//go:wasmexport seedBlocks
+func seedBlocks(input *string) *string {
+	checkOwner()
+	if blocklist.GetLastHeight() > 0 {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "seedBlocks only allowed when h=0"))
+	}
+	var params blocklist.AddBlockEntry
+	json.Unmarshal([]byte(*input), &params)
+	if err := blocklist.HandleSeedBlock(&params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+	}
 	return nil
 }
 

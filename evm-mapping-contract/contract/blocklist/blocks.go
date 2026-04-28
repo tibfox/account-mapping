@@ -102,8 +102,12 @@ type AddBlockEntry struct {
 func HandleAddBlocks(params *AddBlocksParams) error {
 	lastHeight := GetLastHeight()
 
+	if lastHeight == 0 {
+		return errors.New("contract not seeded: call seedBlocks first")
+	}
+
 	for _, entry := range params.Blocks {
-		if lastHeight > 0 && entry.BlockNumber != lastHeight+1 {
+		if entry.BlockNumber != lastHeight+1 {
 			return errors.New("block heights must be sequential")
 		}
 
@@ -163,6 +167,28 @@ func readUint64(buf []byte, offset *int) uint64 {
 		uint64(buf[*offset+6])<<8 | uint64(buf[*offset+7])
 	*offset += 8
 	return v
+}
+
+func HandleSeedBlock(entry *AddBlockEntry) error {
+	txRoot, err := hexTo32(entry.TransactionsRoot)
+	if err != nil {
+		return errors.New("invalid transactions_root hex")
+	}
+	rcptRoot, err := hexTo32(entry.ReceiptsRoot)
+	if err != nil {
+		return errors.New("invalid receipts_root hex")
+	}
+	header := EthBlockHeader{
+		BlockNumber:      entry.BlockNumber,
+		TransactionsRoot: txRoot,
+		ReceiptsRoot:     rcptRoot,
+		BaseFeePerGas:    entry.BaseFeePerGas,
+		GasLimit:         entry.GasLimit,
+		Timestamp:        entry.Timestamp,
+	}
+	StoreHeader(header)
+	SetLastHeight(entry.BlockNumber)
+	return nil
 }
 
 func HandleReplaceBlock(entry *AddBlockEntry) error {

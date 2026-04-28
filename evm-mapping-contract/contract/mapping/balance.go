@@ -1,10 +1,22 @@
 package mapping
 
 import (
+	"errors"
 	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/sdk"
+	"math"
 	"strconv"
 )
+
+func safeAdd64(a, b int64) (int64, error) {
+	if a > 0 && b > math.MaxInt64-a {
+		return 0, errors.New("overflow")
+	}
+	if a < 0 && b < math.MinInt64-a {
+		return 0, errors.New("underflow")
+	}
+	return a + b, nil
+}
 
 func balanceKey(address, asset string) string {
 	return constants.BalancePrefix + address + constants.DirPathDelimiter + asset
@@ -30,9 +42,14 @@ func SetBalance(address, asset string, amount int64) {
 	sdk.StateSetObject(balanceKey(address, asset), strconv.FormatInt(amount, 10))
 }
 
-func IncBalance(address, asset string, amount int64) {
+func IncBalance(address, asset string, amount int64) error {
 	bal := GetBalance(address, asset)
-	SetBalance(address, asset, bal+amount)
+	newBal, err := safeAdd64(bal, amount)
+	if err != nil {
+		return err
+	}
+	SetBalance(address, asset, newBal)
+	return nil
 }
 
 func DecBalance(address, asset string, amount int64) bool {
