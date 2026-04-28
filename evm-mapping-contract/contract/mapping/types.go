@@ -44,6 +44,16 @@ type TokenInfo struct {
 	MinWithdrawal int64  `json:"min_withdrawal"`
 }
 
+// ConfirmSpendRequest carries both tx and receipt proofs for withdrawal confirmation.
+type ConfirmSpendRequest struct {
+	BlockHeight     uint64 `json:"block_height"`
+	TxIndex         uint64 `json:"tx_index"`
+	TxHex           string `json:"tx_hex"`
+	TxProofHex      string `json:"tx_proof_hex"`
+	ReceiptHex      string `json:"receipt_hex"`
+	ReceiptProofHex string `json:"receipt_proof_hex"`
+}
+
 // Parsed EIP-1559 transaction fields
 type ParsedTx struct {
 	ChainId  uint64
