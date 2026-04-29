@@ -20,6 +20,7 @@ const (
 	GasReserveKey           = "gr"                   // gas reserve amount (wei)
 	VaultAddressKey         = "vault"                // vault ETH address
 	ChainIdKey              = "chainid"              // EVM chain ID
+	VerifierContractIdKey   = "zkverifier"           // ZK header verifier contract ID
 )
 
 const MaxBlockRetention = 101
