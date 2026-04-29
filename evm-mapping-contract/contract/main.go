@@ -2,7 +2,6 @@ package main
 
 // EVM Mapping Contract — Magi/VSC
 // - must import sdk or build fails
-// - entrypoints receive payload as *string arg, return *string (nil=success)
 
 import (
 	"encoding/json"
@@ -37,10 +36,14 @@ func chainId() uint64 {
 	return v
 }
 
+// Admin gate: owner only. The legacy `did:vsc:oracle:eth` allowance was
+// removed when the ZK verifier became the source of block headers; the
+// remaining oracle-fed actions (addBlocks, replaceBlock) are kept for
+// emergency use and during the verifier rollout.
 func checkAdmin() {
 	caller := sdk.GetEnv().Caller.String()
 	owner := sdk.GetEnvKey("contract.owner")
-	if caller != "did:vsc:oracle:eth" && (owner == nil || caller != *owner) {
+	if owner == nil || caller != *owner {
 		ce.CustomAbort(ce.NewContractError(ce.ErrNoPermission, "admin required"))
 	}
 }
@@ -172,6 +175,17 @@ func setChainIdAction(input *string) *string {
 func registerRouter(input *string) *string {
 	checkOwner()
 	sdk.StateSetObject(constants.RouterContractIdKey, *input)
+	return nil
+}
+
+//go:wasmexport setVerifierContract
+func setVerifierContract(input *string) *string {
+	checkOwner()
+	var params struct {
+		ContractId string `json:"contract_id"`
+	}
+	json.Unmarshal([]byte(*input), &params)
+	sdk.StateSetObject(constants.VerifierContractIdKey, params.ContractId)
 	return nil
 }
 

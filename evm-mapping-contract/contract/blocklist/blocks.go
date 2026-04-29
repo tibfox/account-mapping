@@ -53,7 +53,7 @@ func StoreHeader(header EthBlockHeader) {
 
 func GetHeader(blockNumber uint64) *EthBlockHeader {
 	key := constants.BlockPrefix + strconv.FormatUint(blockNumber, 10)
-	data := sdk.StateGetObject(key)
+	data := readState(key)
 	if data == nil {
 		return nil
 	}
@@ -70,7 +70,7 @@ func DeleteHeader(blockNumber uint64) {
 }
 
 func GetLastHeight() uint64 {
-	data := sdk.StateGetObject(constants.LastHeightKey)
+	data := readState(constants.LastHeightKey)
 	if data == nil {
 		return 0
 	}
@@ -79,6 +79,21 @@ func GetLastHeight() uint64 {
 		return 0
 	}
 	return h
+}
+
+// readState reads from the ZK verifier contract if configured, otherwise from own state.
+// When a verifier contract ID is set, block headers come from the ZK-verified store.
+// Falls back to own state for backward compatibility with the oracle BLS path.
+func readState(key string) *string {
+	vcid := sdk.StateGetObject(constants.VerifierContractIdKey)
+	if vcid != nil && *vcid != "" {
+		result := sdk.ContractStateGet(*vcid, key)
+		if result == nil || *result == "" {
+			return nil
+		}
+		return result
+	}
+	return sdk.StateGetObject(key)
 }
 
 func SetLastHeight(height uint64) {
