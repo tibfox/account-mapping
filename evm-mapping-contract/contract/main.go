@@ -98,7 +98,7 @@ func unmapERC20(input *string) *string {
 func confirmSpend(input *string) *string {
 	var req mapping.ConfirmSpendRequest
 	json.Unmarshal([]byte(*input), &req)
-	if err := mapping.HandleConfirmSpend(&req, vault()); err != nil {
+	if err := mapping.HandleConfirmSpend(&req, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil

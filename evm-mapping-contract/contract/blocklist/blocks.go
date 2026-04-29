@@ -170,6 +170,9 @@ func readUint64(buf []byte, offset *int) uint64 {
 }
 
 func HandleSeedBlock(entry *AddBlockEntry) error {
+	if entry.BlockNumber == 0 {
+		return errors.New("seed block_number must be > 0")
+	}
 	txRoot, err := hexTo32(entry.TransactionsRoot)
 	if err != nil {
 		return errors.New("invalid transactions_root hex")

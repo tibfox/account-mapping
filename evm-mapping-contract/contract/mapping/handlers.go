@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"evm-mapping-contract/contract/abi"
 	"evm-mapping-contract/contract/blocklist"
 	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/contract/crypto"
@@ -42,8 +43,11 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 
 		dest := routeDeposit(sender, params.Instructions, "eth", amountInt64)
 
-		// Gas reserve tax: 1% of ETH deposits (safe division, no overflow)
-		gasTax := amountInt64 * constants.GasReserveDepositTaxBps / 10000
+		// Gas reserve tax: bps of ETH deposits.
+		// Compute as (amount/10000)*bps + (amount%10000)*bps/10000 so we keep
+		// full precision without ever producing an int64 overflow on amount*bps.
+		gasTax := (amountInt64/10000)*constants.GasReserveDepositTaxBps +
+			(amountInt64%10000)*constants.GasReserveDepositTaxBps/10000
 		if gasTax > 0 {
 			addGasReserve(gasTax)
 			amountInt64 -= gasTax
@@ -258,7 +262,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	return hex.EncodeToString(unsigned), nil
 }
 
-func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte) error {
+func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
 	}
@@ -305,6 +309,20 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte) error {
 	if parsedTx.Nonce != ps.Nonce {
 		return errors.New("tx nonce does not match pending spend")
 	}
+	if parsedTx.ChainId != chainId {
+		return errors.New("tx chain id does not match contract chain id")
+	}
+
+	// Recover sender — the only valid signer of the vault's nonces is the vault itself.
+	sighash := computeTxSighash(txBytes, parsedTx)
+	recoveredSender, err := crypto.Ecrecover(sighash, 27+parsedTx.V, padTo32(parsedTx.R), padTo32(parsedTx.S))
+	if err != nil {
+		return errors.New("ecrecover failed: " + err.Error())
+	}
+	if recoveredSender != vaultAddress {
+		return errors.New("tx not signed by vault")
+	}
+
 	psTo, err := crypto.HexToAddress(ps.To)
 	if err != nil {
 		return errors.New("invalid pending spend destination")
@@ -314,8 +332,39 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte) error {
 			return errors.New("tx destination does not match pending spend")
 		}
 		txAmount := new(big.Int).SetBytes(parsedTx.Value)
-		if txAmount.Int64() != ps.Amount {
+		if !txAmount.IsInt64() || txAmount.Int64() != ps.Amount {
 			return errors.New("tx amount does not match pending spend")
+		}
+	} else {
+		// ERC-20: tx.to is the token contract, value is 0, calldata is transfer(recipient, amount).
+		tokenAddr, err := crypto.HexToAddress(ps.TokenAddress)
+		if err != nil {
+			return errors.New("invalid pending spend token address")
+		}
+		if parsedTx.To != tokenAddr {
+			return errors.New("tx token contract does not match pending spend")
+		}
+		if new(big.Int).SetBytes(parsedTx.Value).Sign() != 0 {
+			return errors.New("erc20 tx must have zero value")
+		}
+		if len(parsedTx.Data) != 68 {
+			return errors.New("erc20 calldata must be 68 bytes")
+		}
+		if !bytesEqual(parsedTx.Data[0:4], abi.TransferSelector) {
+			return errors.New("erc20 calldata selector mismatch")
+		}
+		// First 12 bytes of address slot must be zero (left-padded address).
+		for _, b := range parsedTx.Data[4:16] {
+			if b != 0 {
+				return errors.New("erc20 recipient padding non-zero")
+			}
+		}
+		if !bytesEqual(parsedTx.Data[16:36], psTo[:]) {
+			return errors.New("erc20 recipient does not match pending spend")
+		}
+		callAmount := new(big.Int).SetBytes(parsedTx.Data[36:68])
+		if !callAmount.IsInt64() || callAmount.Int64() != ps.Amount {
+			return errors.New("erc20 amount does not match pending spend")
 		}
 	}
 
@@ -353,13 +402,16 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte) error {
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
 	} else {
-		if err := IncBalance(ps.From, ps.Asset, ps.Amount); err != nil {
-			return errors.New("refund overflow")
+		// Best-effort refund. If IncBalance overflows (user already at int64 max),
+		// we still clear pending state — otherwise the contract is permanently
+		// jammed for a near-impossible scenario. Only update supply when the
+		// refund actually landed so balance and supply stay consistent.
+		if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
+			s := GetSupply(ps.Asset)
+			s.Active += ps.Amount
+			s.User += ps.Amount
+			SetSupply(ps.Asset, s)
 		}
-		s := GetSupply(ps.Asset)
-		s.Active += ps.Amount
-		s.User += ps.Amount
-		SetSupply(ps.Asset, s)
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
 	}
@@ -750,11 +802,16 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	_ = IncBalance(ps.From, ps.Asset, ps.Amount)
-	sup := GetSupply(ps.Asset)
-	sup.Active += ps.Amount
-	sup.User += ps.Amount
-	SetSupply(ps.Asset, sup)
+	// Best-effort refund: if the user's balance is at the int64 ceiling we cannot
+	// credit them, but the contract MUST still advance the nonce or it will jam.
+	// Only update supply when the refund actually landed, otherwise balance and
+	// supply diverge.
+	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
+		sup := GetSupply(ps.Asset)
+		sup.Active += ps.Amount
+		sup.User += ps.Amount
+		SetSupply(ps.Asset, sup)
+	}
 	DeletePendingSpend(confirmedNonce)
 	SetConfirmedNonce(confirmedNonce + 1)
 	SetPendingNonce(confirmedNonce + 1)
