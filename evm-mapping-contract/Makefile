@@ -2,10 +2,8 @@ ROOT_DIR 		:= $(abspath .)
 BIN_DIR			:= bin
 
 TARGET = contract/main.go
-BASEFLAGS = -gc=custom -scheduler=none -panic=trap -no-debug -target=wasm-unknown
-TESTNET3FLAGS = -ldflags="-X 'main.NetworkMode=testnet3'"
-TESTNET4FLAGS = -ldflags="-X 'main.NetworkMode=testnet4'"
-REGTESTFLAGS  = -ldflags="-X 'main.NetworkMode=regtest'"
+WASM = $(BIN_DIR)/main.wasm
+BUILD_FLAGS = -gc=custom -scheduler=none -panic=trap -no-debug -target=wasm-unknown
 
 TINYJSON		:= tinyjson
 TINYJSON_FLAGS 	:= -snake_case -no_std_marshalers
@@ -47,37 +45,16 @@ ifneq ($(RUN_ARGS),)
 endif
 $(eval $(RUN_ARGS):;@:)
 
-netflags = \
-	$(if $(filter testnet3,$1),$(TESTNET3FLAGS), \
-	$(if $(filter testnet4,$1),$(TESTNET4FLAGS), \
-	$(if $(filter regtest dev,$1),$(REGTESTFLAGS), \
-	$(if $(filter mainnet,$1),, \
-	$(error Unknown NETWORK: $1)))))
-
-all: dev
-
-# Fetch the latest commit on the testnet branch and update the replace directive.
-update-vsc-node:
-	@NEWVER=$$(go list -m github.com/vsc-eco/go-vsc-node@testnet | awk '{print $$2}') && \
-	CURVER=$$(awk '!/^[[:space:]]*\/\// && /replace vsc-node =>/ {print $$NF}' go.mod) && \
-	if [ "$$NEWVER" != "$$CURVER" ]; then \
-		echo "vsc-node $$CURVER -> $$NEWVER" && \
-		go mod edit -replace=vsc-node=github.com/vsc-eco/go-vsc-node@$$NEWVER && \
-		go mod tidy; \
-	fi
-
-.PHONY: update-vsc-node
-
-# Run update-vsc-node before any build or test target.
-all dev testnet3 testnet4 mainnet regtest test: | update-vsc-node
+all: build
 
 pull-tinygo:
 	docker pull $(TINYGO_IMAGE)
 
 MODULE := $(shell head -1 go.mod | awk '{print $$2}')
 
-dev testnet3 testnet4 mainnet regtest:
-	@wasm_file="$(BIN_DIR)/$@.wasm"; \
+build:
+	@mkdir -p $(BIN_DIR); \
+	wasm_file="$(WASM)"; \
 	dir="$(ROOT_DIR)/$(dir $(TARGET))"; \
 	dir="$${dir%/}"; \
 	if [ -f "$$wasm_file" ]; then \
@@ -106,14 +83,14 @@ dev testnet3 testnet4 mainnet regtest:
 		if [ "$$needs_rebuild" -eq 0 ] && \
 		   [ ! "$(ROOT_DIR)/go.mod" -nt "$$wasm_file" ] && \
 		   [ ! "$(ROOT_DIR)/go.sum" -nt "$$wasm_file" ]; then \
-			echo "⏩ $@ is up to date, skipping"; \
+			echo "⏩ $$wasm_file is up to date, skipping"; \
 		else \
-			echo "Building $@ ..."; \
-			$(TINYGO_CMD) build $(BASEFLAGS) $(call netflags,$@) -o $$wasm_file $(TARGET); \
+			echo "Building $$wasm_file ..."; \
+			$(TINYGO_CMD) build $(BUILD_FLAGS) -o $$wasm_file $(TARGET); \
 		fi; \
 	else \
-		echo "Building $@ ..."; \
-		$(TINYGO_CMD) build $(BASEFLAGS) $(call netflags,$@) -o $$wasm_file $(TARGET); \
+		echo "Building $$wasm_file ..."; \
+		$(TINYGO_CMD) build $(BUILD_FLAGS) -o $$wasm_file $(TARGET); \
 	fi
 
 strip:
@@ -219,7 +196,9 @@ tinyjson:
 	done
 
 test:
-	cd tests/current && go test -v -p 1 -parallel 1 -run "$(FILTER)"
+	go test -v -run "$(FILTER)" ./...
 
 clean:
 	rm -rf $(BIN_DIR)/*.wasm
+
+.PHONY: all build pull-tinygo strip tinyjson test clean
