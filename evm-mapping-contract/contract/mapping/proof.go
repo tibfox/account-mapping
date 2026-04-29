@@ -96,7 +96,11 @@ func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte
 
 // VerifyERC20Deposit verifies an ERC-20 deposit via receipt inclusion proof.
 // Returns the sender address, token amount (big-endian bytes), and the tx hash.
-func VerifyERC20Deposit(req *VerificationRequest, vaultAddress [20]byte, tokenAddr [20]byte) ([20]byte, []byte, [32]byte, error) {
+func VerifyERC20Deposit(
+	req *VerificationRequest,
+	vaultAddress [20]byte,
+	tokenAddr [20]byte,
+) ([20]byte, []byte, [32]byte, error) {
 	var sender [20]byte
 	var txHash [32]byte
 
@@ -274,7 +278,12 @@ func computeTxSighash(raw []byte, tx *ParsedTx) []byte {
 		unsigned := make([][]byte, 9)
 		for i := 0; i < 9; i++ {
 			if items[i].IsList {
-				// Re-encode the list as-is (preserves access list contents)
+				// BUG: this only preserves a single level of children. EIP-2930
+				// access list entries are themselves lists ([address, [storageKeys...]]),
+				// so the storage-keys sublist is silently re-encoded as empty here. The
+				// resulting sighash will mismatch for any tx with non-empty storage keys.
+				// Safe today only because BuildETHWithdrawalTx / BuildERC20WithdrawalTx
+				// always emit an empty access list (withdrawal.go:114).
 				children := make([][]byte, len(items[i].Children))
 				for j, child := range items[i].Children {
 					if child.IsList {
@@ -305,9 +314,9 @@ func computeTxSighash(raw []byte, tx *ParsedTx) []byte {
 		rlp.EncodeBytes(items[3].AsBytes()), // to
 		rlp.EncodeBytes(items[4].AsBytes()), // value
 		rlp.EncodeBytes(items[5].AsBytes()), // data
-		chainIdBytes,                         // chainId
-		empty,                                // 0
-		empty,                                // 0
+		chainIdBytes,                        // chainId
+		empty,                               // 0
+		empty,                               // 0
 	)
 	return crypto.Keccak256(unsigned)
 }
