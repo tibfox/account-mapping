@@ -10,6 +10,7 @@ import (
 
 type EthBlockHeader struct {
 	BlockNumber      uint64
+	StateRoot        [32]byte
 	TransactionsRoot [32]byte
 	ReceiptsRoot     [32]byte
 	BaseFeePerGas    uint64
@@ -18,8 +19,9 @@ type EthBlockHeader struct {
 }
 
 func (h *EthBlockHeader) Serialize() string {
-	buf := make([]byte, 0, 120)
+	buf := make([]byte, 0, 128)
 	buf = appendUint64(buf, h.BlockNumber)
+	buf = append(buf, h.StateRoot[:]...)
 	buf = append(buf, h.TransactionsRoot[:]...)
 	buf = append(buf, h.ReceiptsRoot[:]...)
 	buf = appendUint64(buf, h.BaseFeePerGas)
@@ -30,12 +32,14 @@ func (h *EthBlockHeader) Serialize() string {
 
 func DeserializeHeader(data string) (*EthBlockHeader, error) {
 	buf := []byte(data)
-	if len(buf) < 96 { // 8 + 32 + 32 + 8 + 8 + 8 = 96
+	if len(buf) < 128 { // 8 + 32 + 32 + 32 + 8 + 8 + 8 = 128
 		return nil, errors.New("header data too short")
 	}
 	h := &EthBlockHeader{}
 	offset := 0
 	h.BlockNumber = readUint64(buf, &offset)
+	copy(h.StateRoot[:], buf[offset:offset+32])
+	offset += 32
 	copy(h.TransactionsRoot[:], buf[offset:offset+32])
 	offset += 32
 	copy(h.ReceiptsRoot[:], buf[offset:offset+32])
@@ -107,6 +111,7 @@ type AddBlocksParams struct {
 
 type AddBlockEntry struct {
 	BlockNumber      uint64 `json:"block_number"`
+	StateRoot        string `json:"state_root"`
 	TransactionsRoot string `json:"transactions_root"`
 	ReceiptsRoot     string `json:"receipts_root"`
 	BaseFeePerGas    uint64 `json:"base_fee_per_gas"`
@@ -126,6 +131,10 @@ func HandleAddBlocks(params *AddBlocksParams) error {
 			return errors.New("block heights must be sequential")
 		}
 
+		stateRoot, err := hexTo32(entry.StateRoot)
+		if err != nil {
+			return errors.New("invalid state_root hex")
+		}
 		txRoot, err := hexTo32(entry.TransactionsRoot)
 		if err != nil {
 			return errors.New("invalid transactions_root hex")
@@ -137,6 +146,7 @@ func HandleAddBlocks(params *AddBlocksParams) error {
 
 		header := EthBlockHeader{
 			BlockNumber:      entry.BlockNumber,
+			StateRoot:        stateRoot,
 			TransactionsRoot: txRoot,
 			ReceiptsRoot:     rcptRoot,
 			BaseFeePerGas:    entry.BaseFeePerGas,
@@ -215,6 +225,10 @@ func HandleReplaceBlock(entry *AddBlockEntry) error {
 		return errors.New("block not found for replacement")
 	}
 
+	stateRoot, err := hexTo32(entry.StateRoot)
+	if err != nil {
+		return errors.New("invalid state_root hex")
+	}
 	txRoot, err := hexTo32(entry.TransactionsRoot)
 	if err != nil {
 		return errors.New("invalid transactions_root hex")
@@ -226,6 +240,7 @@ func HandleReplaceBlock(entry *AddBlockEntry) error {
 
 	header := EthBlockHeader{
 		BlockNumber:      entry.BlockNumber,
+		StateRoot:        stateRoot,
 		TransactionsRoot: txRoot,
 		ReceiptsRoot:     rcptRoot,
 		BaseFeePerGas:    entry.BaseFeePerGas,
