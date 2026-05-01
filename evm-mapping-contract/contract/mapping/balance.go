@@ -1,8 +1,8 @@
 package mapping
 
 import (
-	"errors"
 	"evm-mapping-contract/contract/constants"
+	ce "evm-mapping-contract/contract/contracterrors"
 	"evm-mapping-contract/sdk"
 	"math"
 	"strconv"
@@ -10,10 +10,10 @@ import (
 
 func safeAdd64(a, b int64) (int64, error) {
 	if a > 0 && b > math.MaxInt64-a {
-		return 0, errors.New("overflow")
+		return 0, ce.NewContractError(ce.ErrArithmetic, "overflow")
 	}
 	if a < 0 && b < math.MinInt64-a {
-		return 0, errors.New("underflow")
+		return 0, ce.NewContractError(ce.ErrArithmetic, "underflow")
 	}
 	return a + b, nil
 }
@@ -38,21 +38,21 @@ func safeAdd64(a, b int64) (int64, error) {
 func safeGasFee(gasUnits, baseFeePerGas, multiplier, gasTipCap uint64) (uint64, int64, error) {
 	scaled := baseFeePerGas * multiplier
 	if baseFeePerGas != 0 && multiplier != 0 && scaled/multiplier != baseFeePerGas {
-		return 0, 0, errors.New("gas fee cap overflow")
+		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee cap overflow")
 	}
 	gasFeeCap := scaled + gasTipCap
 	if gasFeeCap < scaled {
-		return 0, 0, errors.New("gas fee cap overflow")
+		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee cap overflow")
 	}
 	if gasUnits == 0 || gasFeeCap == 0 {
 		return gasFeeCap, 0, nil
 	}
 	product := gasUnits * gasFeeCap
 	if product/gasFeeCap != gasUnits {
-		return 0, 0, errors.New("gas fee overflow")
+		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee overflow")
 	}
 	if product > math.MaxInt64 {
-		return 0, 0, errors.New("gas fee exceeds int64")
+		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee exceeds int64")
 	}
 	return gasFeeCap, int64(product), nil
 }

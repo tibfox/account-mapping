@@ -62,7 +62,7 @@ func addBlocks(input *string) *string {
 	var params blocklist.AddBlocksParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := blocklist.HandleAddBlocks(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -72,7 +72,7 @@ func mapDeposit(input *string) *string {
 	var params mapping.MapParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleMap(&params, vault()); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -82,7 +82,7 @@ func unmapETH(input *string) *string {
 	var params mapping.TransferParams
 	json.Unmarshal([]byte(*input), &params)
 	if _, err := mapping.HandleUnmapETH(&params, vault(), chainId()); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -92,7 +92,7 @@ func unmapERC20(input *string) *string {
 	var params mapping.TransferParams
 	json.Unmarshal([]byte(*input), &params)
 	if _, err := mapping.HandleUnmapERC20(&params, vault(), chainId()); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -102,7 +102,7 @@ func confirmSpend(input *string) *string {
 	var req mapping.ConfirmSpendRequest
 	json.Unmarshal([]byte(*input), &req)
 	if err := mapping.HandleConfirmSpend(&req, vault(), chainId()); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -112,7 +112,7 @@ func transfer(input *string) *string {
 	var params mapping.TransferParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleTransfer(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -122,7 +122,7 @@ func transferFrom(input *string) *string {
 	var params mapping.TransferParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleTransferFrom(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -132,7 +132,7 @@ func approve(input *string) *string {
 	var params mapping.AllowanceParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleApprove(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -144,7 +144,7 @@ func registerToken(input *string) *string {
 	json.Unmarshal([]byte(*input), &params)
 	addr, err := crypto.HexToAddress(params.Address)
 	if err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "invalid address"))
+		ce.CustomAbort(ce.Prepend(err, "registerToken"))
 	}
 	mapping.RegisterToken(addr, params.Symbol, params.Decimals, params.MinWithdrawal)
 	return nil
@@ -204,7 +204,7 @@ func adminMint(input *string) *string {
 	// review2 #42: AdminCredit also updates Supply so admin mints don't
 	// desync balance vs. supply accounting.
 	if err := mapping.AdminCredit(params.Address, params.Asset, params.Amount); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "balance overflow"))
+		ce.CustomAbort(ce.WrapContractError(ce.ErrArithmetic, err, "adminMint"))
 	}
 	return nil
 }
@@ -222,7 +222,7 @@ func replaceBlock(input *string) *string {
 	var params blocklist.AddBlockEntry
 	json.Unmarshal([]byte(*input), &params)
 	if err := blocklist.HandleReplaceBlock(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -232,7 +232,7 @@ func unmapFrom(input *string) *string {
 	var params mapping.TransferParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleUnmapFrom(&params, vault(), chainId()); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -256,7 +256,7 @@ func increaseAllowance(input *string) *string {
 	var params mapping.AllowanceParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleIncreaseAllowance(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -266,7 +266,7 @@ func decreaseAllowance(input *string) *string {
 	var params mapping.AllowanceParams
 	json.Unmarshal([]byte(*input), &params)
 	if err := mapping.HandleDecreaseAllowance(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
@@ -294,7 +294,7 @@ func seedBlocks(input *string) *string {
 	var params blocklist.AddBlockEntry
 	json.Unmarshal([]byte(*input), &params)
 	if err := blocklist.HandleSeedBlock(&params); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		ce.CustomAbort(err)
 	}
 	return nil
 }
