@@ -353,6 +353,9 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId
 	if err != nil {
 		return errors.New("ecrecover failed: " + err.Error())
 	}
+	if recoveredSender == ([20]byte{}) {
+		return errors.New("ecrecover returned zero address")
+	}
 	if recoveredSender != vaultAddress {
 		return errors.New("tx not signed by vault")
 	}
