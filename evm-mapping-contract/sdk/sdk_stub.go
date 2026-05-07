@@ -202,3 +202,8 @@ func TestStateGet(key string) (string, bool) { v, ok := testState[key]; return v
 
 // TestStateLen returns the number of stored state keys.
 func TestStateLen() int { return len(testState) }
+
+// ResetTestStateStore is a compatibility alias for the review-5 (pentest)
+// test files, which predate the review2 harness naming. Both clear the same
+// in-memory store, so it forwards to ResetTestState.
+func ResetTestStateStore() { ResetTestState() }
