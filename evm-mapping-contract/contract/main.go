@@ -46,6 +46,22 @@ func checkAdmin() {
 	checkOwner()
 }
 
+// unmarshalParams is the canonical wasmexport unmarshal step.
+// Pentest finding F2: every wasmexport in this file used to call
+// json.Unmarshal and discard the error, which let garbage JSON
+// silently produce a zero-valued struct that the handler then
+// ran on. This helper aborts the contract with an ErrJson-tagged
+// ContractError so callers can tell parse errors apart from
+// business-logic errors.
+func unmarshalParams(input *string, dest interface{}) {
+	if input == nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrJson, "payload required"))
+	}
+	if err := json.Unmarshal([]byte(*input), dest); err != nil {
+		ce.CustomAbort(ce.WrapContractError(ce.ErrJson, err))
+	}
+}
+
 func checkOwner() {
 	caller := sdk.GetEnv().Caller.String()
 	owner := sdk.GetEnvKey("contract.owner")
@@ -117,7 +133,7 @@ func initContract(input *string) *string {
 //go:wasmexport map
 func mapDeposit(input *string) *string {
 	var params mapping.MapParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleMap(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.WrapContractError(ce.ErrInput, err))
 	}
@@ -127,7 +143,7 @@ func mapDeposit(input *string) *string {
 //go:wasmexport unmapETH
 func unmapETH(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if _, err := mapping.HandleUnmapETH(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -137,7 +153,7 @@ func unmapETH(input *string) *string {
 //go:wasmexport unmapERC20
 func unmapERC20(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if _, err := mapping.HandleUnmapERC20(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -147,7 +163,7 @@ func unmapERC20(input *string) *string {
 //go:wasmexport confirmSpend
 func confirmSpend(input *string) *string {
 	var req mapping.ConfirmSpendRequest
-	json.Unmarshal([]byte(*input), &req)
+	unmarshalParams(input, &req)
 	// W4 Cluster F: HandleConfirmSpend signature has NO vaultAddress
 	// parameter — it reads ps.VaultAtQueue from the stored PendingSpend.
 	if err := mapping.HandleConfirmSpend(&req, chainId()); err != nil {
@@ -159,7 +175,7 @@ func confirmSpend(input *string) *string {
 //go:wasmexport transfer
 func transfer(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleTransfer(&params); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -169,7 +185,7 @@ func transfer(input *string) *string {
 //go:wasmexport transferFrom
 func transferFrom(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleTransferFrom(&params); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -179,7 +195,7 @@ func transferFrom(input *string) *string {
 //go:wasmexport approve
 func approve(input *string) *string {
 	var params mapping.AllowanceParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleApprove(&params); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -189,7 +205,7 @@ func approve(input *string) *string {
 //go:wasmexport unmapFrom
 func unmapFrom(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleUnmapFrom(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -199,7 +215,7 @@ func unmapFrom(input *string) *string {
 //go:wasmexport increaseAllowance
 func increaseAllowance(input *string) *string {
 	var params mapping.AllowanceParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleIncreaseAllowance(&params); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -209,7 +225,7 @@ func increaseAllowance(input *string) *string {
 //go:wasmexport decreaseAllowance
 func decreaseAllowance(input *string) *string {
 	var params mapping.AllowanceParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := mapping.HandleDecreaseAllowance(&params); err != nil {
 		ce.CustomAbort(err)
 	}
@@ -227,7 +243,7 @@ func getInfo(_ *string) *string { return nil }
 func addBlocks(input *string) *string {
 	checkOracleAccount()
 	var params blocklist.AddBlocksParams
-	json.Unmarshal([]byte(*input), &params)
+	unmarshalParams(input, &params)
 	if err := blocklist.HandleAddBlocks(&params, chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
