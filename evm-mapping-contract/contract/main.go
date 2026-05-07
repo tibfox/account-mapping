@@ -401,6 +401,12 @@ func dispatchAdmin(action string, payload []byte) {
 		if err := json.Unmarshal(payload, &p); err != nil {
 			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setVerifierContract: bad payload"))
 		}
+		// Pentest finding EVM-C8: an empty verifier id silently regresses
+		// readState back to BLS-oracle headers (or nothing). Reject so the
+		// verifier can only ever land on a real, non-empty id.
+		if p.ContractId == "" {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "verifier contract_id must be non-empty"))
+		}
 		sdk.StateSetObject(constants.VerifierContractIdKey, p.ContractId)
 
 	case "createKey":

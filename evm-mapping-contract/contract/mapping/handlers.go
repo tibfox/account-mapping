@@ -12,6 +12,7 @@ import (
 	"evm-mapping-contract/contract/mpt"
 	"evm-mapping-contract/contract/rlp"
 	"evm-mapping-contract/sdk"
+	"math"
 	"math/big"
 	"strconv"
 )
@@ -803,7 +804,15 @@ func getGasReserve() int64 {
 
 func addGasReserve(amount int64) {
 	current := getGasReserve()
-	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(current+amount, 10))
+	// Pentest finding EVM-C10: bare current+amount could overflow
+	// int64 (~92,000 ETH economically impractical, but cheap to
+	// guard against). On overflow, clamp to MaxInt64 so the
+	// reserve still grows but can't wrap negative.
+	sum, err := SafeAdd64(current, amount)
+	if err != nil {
+		sum = math.MaxInt64
+	}
+	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(sum, 10))
 }
 
 func deductGasReserve(amount int64) {
