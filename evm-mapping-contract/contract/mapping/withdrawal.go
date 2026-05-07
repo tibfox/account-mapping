@@ -88,6 +88,11 @@ type PendingSpend struct {
 	// internal contract field and the JSON tag is omitempty so the field
 	// is absent for ETH withdrawals.
 	TokenAddress string `json:"token_address,omitempty"`
+	// GasCost is the gas-reserve amount (gwei, post-Step-3b) deducted when
+	// this withdrawal was submitted. Refunded by HandleConfirmSpend's
+	// failure branch (pentest finding EVM-C4). omitempty so ETH/zero
+	// entries stay compact; JSON marshal/unmarshal carry it automatically.
+	GasCost int64 `json:"gas_cost,omitempty"`
 }
 
 func StorePendingSpend(ps PendingSpend) {
@@ -95,7 +100,8 @@ func StorePendingSpend(ps PendingSpend) {
 	// v18 §AE: switch from pipe-delimited positional to JSON. Adding the
 	// VaultAtQueue field would silently break the positional parser for
 	// pre-upgrade entries (len(fields)==7 path), so the storage format
-	// changes atomically with the new field.
+	// changes atomically with the new field. EVM-C4's GasCost rides along
+	// in the JSON automatically (tagged field).
 	jsonBytes, err := json.Marshal(ps)
 	if err != nil {
 		sdk.Revert("pendingSpend marshal failed", "storePendingSpend")

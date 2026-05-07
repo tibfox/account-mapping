@@ -383,6 +383,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 		UnsignedTxHex: hex.EncodeToString(unsigned),
 		BlockHeight:   blocklist.GetLastHeight(),
 		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
+		GasCost:       gasCost / 1_000_000_000, // gwei reserve deducted; refunded on failed receipt (EVM-C4)
 	})
 	SetPendingNonce(nonce + 1)
 
@@ -580,6 +581,14 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 			s.Active += ps.Amount
 			s.User += ps.Amount
 			SetSupply(ps.Asset, s)
+		}
+		// Pentest finding EVM-C4: previously the gas reserve that
+		// was charged at unmap time was never refunded on a failed
+		// receipt. ~383 failed ERC-20 withdrawals would exhaust
+		// 0.05 ETH and then block ALL withdrawals. Restore the
+		// reserve so the bridge keeps working.
+		if ps.GasCost > 0 {
+			addGasReserve(ps.GasCost)
 		}
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
@@ -939,6 +948,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	var unsigned []byte
 	var asset string
 	var tokenAddress string
+	var deductedGas int64
 	if params.Asset == "eth" {
 		// W4-A Step 3b: ETH amount is gwei; scale to wei for the L1 tx.
 		amountBig := new(big.Int).Mul(big.NewInt(amount), WeiPerGwei)
@@ -956,7 +966,9 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		if feeErr != nil {
 			return ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 		}
-		deductGasReserve(gasReserveFee / 1_000_000_000)
+		gasCostGwei := gasReserveFee / 1_000_000_000
+		deductGasReserve(gasCostGwei)
+		deductedGas = gasCostGwei // recorded for the EVM-C4 refund on failed receipt
 	}
 
 	sighash := ComputeSighash(unsigned)
@@ -973,6 +985,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		UnsignedTxHex: hex.EncodeToString(unsigned),
 		BlockHeight:   blocklist.GetLastHeight(),
 		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
+		GasCost:       deductedGas, // gwei reserve deducted; refunded on failed receipt (EVM-C4)
 	})
 	SetPendingNonce(nonce + 1)
 	return nil
