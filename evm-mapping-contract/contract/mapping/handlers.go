@@ -370,9 +370,12 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId
 		return ce.NewContractError(ce.ErrTransaction, "tx chain id does not match contract chain id")
 	}
 
-	// Recover sender — the only valid signer of the vault's nonces is the vault itself.
+	// CRIT #11 site 6 (SYSTEM, REJECT): vault TSS-sig recovery. Post
+	// CRIT #24, TSS-lib always produces low-S signatures, so high-S here
+	// signals tampering or replay-with-malleated-sig. Use EcrecoverStrict
+	// so any non-canonical sig is rejected rather than normalized through.
 	sighash := computeTxSighash(txBytes, parsedTx)
-	recoveredSender, err := crypto.Ecrecover(sighash, 27+parsedTx.V, padTo32(parsedTx.R), padTo32(parsedTx.S))
+	recoveredSender, err := crypto.EcrecoverStrict(sighash, 27+parsedTx.V, padTo32(parsedTx.R), padTo32(parsedTx.S))
 	if err != nil {
 		return ce.Prepend(err, "ecrecover")
 	}

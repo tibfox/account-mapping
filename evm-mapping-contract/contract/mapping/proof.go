@@ -80,7 +80,10 @@ func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte
 	rPadded := padTo32(parsedTx.R)
 	sPadded := padTo32(parsedTx.S)
 
-	sender, err = crypto.Ecrecover(sighash, recoveryV, rPadded, sPadded)
+	// CRIT #11 site 5 (USER, NORMALIZE): post-EIP-2 L1 blocks cannot carry
+	// high-S signatures, so EcrecoverCanonical accepts the same low-S
+	// envelope SYSTEM sigs require.
+	sender, err = crypto.EcrecoverCanonical(sighash, recoveryV, rPadded, sPadded)
 	if err != nil {
 		return sender, nil, txHash, ce.Prepend(err, "ecrecover failed")
 	}

@@ -3,6 +3,7 @@ package crypto
 import (
 	"encoding/hex"
 	ce "evm-mapping-contract/contract/contracterrors"
+	"strconv"
 	"strings"
 
 	"evm-mapping-contract/sdk"
@@ -18,7 +19,37 @@ func Keccak256Hash(data []byte) [32]byte {
 	return result
 }
 
+// Ecrecover is the legacy wrapper kept for source-compat with existing
+// call sites. Behavior is canonical-by-default per the host fix in
+// modules/wasm/sdk/sdk.go (CRIT #11) — high-S sigs are normalized to
+// low-S host-side before recovery. New contract code should prefer
+// EcrecoverStrict (SYSTEM) or EcrecoverCanonical (USER) for explicit
+// per-site policy.
 func Ecrecover(hash []byte, v byte, r, s []byte) ([20]byte, error) {
+	return ecrecoverDispatch(hash, v, r, s, sdk.Ecrecover)
+}
+
+// EcrecoverStrict — CRIT #11 site 4 REJECT-path wrapper. Returns an
+// error (via the host) if s > N/2. Use at SYSTEM signature sites where
+// malleable sigs must never be accepted (e.g. vault TSS-sig verify).
+func EcrecoverStrict(hash []byte, v byte, r, s []byte) ([20]byte, error) {
+	return ecrecoverDispatch(hash, v, r, s, sdk.EcrecoverStrict)
+}
+
+// EcrecoverCanonical — CRIT #11 site 4 NORMALIZE-path wrapper. Accepts
+// high-S sigs by canonicalizing host-side. Use at USER signature sites
+// where legacy wallets may legitimately emit high-S (e.g. ETH deposit
+// verify in proof.go) AND callers downstream dedup by signature bytes.
+func EcrecoverCanonical(hash []byte, v byte, r, s []byte) ([20]byte, error) {
+	return ecrecoverDispatch(hash, v, r, s, sdk.EcrecoverCanonical)
+}
+
+func ecrecoverDispatch(
+	hash []byte,
+	v byte,
+	r, s []byte,
+	hostFn func([]byte, []byte) ([]byte, error),
+) ([20]byte, error) {
 	var addr [20]byte
 	if len(hash) != 32 {
 		return addr, ce.NewContractError(ce.ErrTransaction, "hash must be 32 bytes")
@@ -36,7 +67,7 @@ func Ecrecover(hash []byte, v byte, r, s []byte) ([20]byte, error) {
 		sig[64] = v
 	}
 
-	recovered, err := sdk.Ecrecover(hash, sig)
+	recovered, err := hostFn(hash, sig)
 	if err != nil {
 		return addr, ce.WrapContractError(ce.ErrTransaction, err, "ecrecover")
 	}
@@ -51,8 +82,20 @@ func AddressToHex(addr [20]byte) string {
 	return "0x" + hex.EncodeToString(addr[:])
 }
 
+// AddressToDID — W4 Cluster B CRIT #6 Site 3 + CRIT #29 forward-proof:
+// the chainId is now read from contract state and threaded into the
+// did:pkh literal. Previously hardcoded "did:pkh:eip155:1:" which produced
+// mainnet-prefixed DIDs even on testnet. Site 11 (evm-mapping.wasm data
+// section) auto-changes when this Go literal changes — recompile the WASM
+// and the rodata segment will drop the "eip155:1:" string; CID changes;
+// operator runbook P5 covers redeploy logistics.
+//
+// Migration policy (CRIT-FIX-MAP §11.3): NEW DIDs use correct chainId
+// after this change; OLD testnet DIDs still have `:1:` literal. Testnet
+// redeploy wipes DID registry; mainnet is fresh deploy so all DIDs are
+// chainId-correct from genesis.
 func AddressToDID(addr [20]byte, chainId uint64) string {
-	return "did:pkh:eip155:1:" + AddressToHex(addr)
+	return "did:pkh:eip155:" + strconv.FormatUint(chainId, 10) + ":" + AddressToHex(addr)
 }
 
 func HexToAddress(s string) ([20]byte, error) {
