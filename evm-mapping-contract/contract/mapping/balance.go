@@ -8,7 +8,11 @@ import (
 	"strconv"
 )
 
-func safeAdd64(a, b int64) (int64, error) {
+// SafeAdd64 returns a+b, returning an error on int64 overflow/underflow.
+// Exported per CRIT #3 v17 correction B so callers outside `mapping`
+// (e.g. handlers.go, supply.go) route balance arithmetic through one
+// audited helper.
+func SafeAdd64(a, b int64) (int64, error) {
 	if a > 0 && b > math.MaxInt64-a {
 		return 0, ce.NewContractError(ce.ErrArithmetic, "overflow")
 	}
@@ -83,7 +87,7 @@ func SetBalance(address, asset string, amount int64) {
 
 func IncBalance(address, asset string, amount int64) error {
 	bal := GetBalance(address, asset)
-	newBal, err := safeAdd64(bal, amount)
+	newBal, err := SafeAdd64(bal, amount)
 	if err != nil {
 		return err
 	}
@@ -92,6 +96,14 @@ func IncBalance(address, asset string, amount int64) error {
 }
 
 func DecBalance(address, asset string, amount int64) bool {
+	// CRIT #3: reject non-positive amount. Without this guard, a negative
+	// amount drives `bal - amount` upward and SetBalance writes a credit —
+	// free vault drain. Signature is bool (not (bool,error)) to preserve
+	// every existing caller. Negative/zero amounts are programmer errors,
+	// not user-recoverable conditions.
+	if amount <= 0 {
+		return false
+	}
 	bal := GetBalance(address, asset)
 	if bal < amount {
 		return false

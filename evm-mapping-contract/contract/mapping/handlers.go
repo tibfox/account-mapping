@@ -3,6 +3,7 @@ package mapping
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"evm-mapping-contract/contract/abi"
 	"evm-mapping-contract/contract/blocklist"
 	"evm-mapping-contract/contract/constants"
@@ -58,7 +59,10 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 				return ce.WrapContractError(ce.ErrArithmetic, err, "balance overflow")
 			}
 		}
-		TrackDeposit("eth", amountInt64, gasTax)
+		// CRIT #3: TrackDeposit now returns on supply-accumulator overflow.
+		if err := TrackDeposit("eth", amountInt64, gasTax); err != nil {
+			return err
+		}
 		return nil
 
 	case "erc20":
@@ -89,7 +93,10 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 				return ce.WrapContractError(ce.ErrArithmetic, err, "balance overflow")
 			}
 		}
-		TrackDeposit(tokenInfo.Symbol, amountInt64, 0)
+		// CRIT #3: TrackDeposit now returns on supply-accumulator overflow.
+		if err := TrackDeposit(tokenInfo.Symbol, amountInt64, 0); err != nil {
+			return err
+		}
 		return nil
 
 	default:
@@ -145,16 +152,32 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	}
 
 	if params.MaxFee != "" {
-		maxFee, _ := strconv.ParseInt(params.MaxFee, 10, 64)
-		if maxFee > 0 && fee > maxFee {
-			return "", ce.NewContractError(ce.ErrIntent, "fee exceeds max_fee")
+		maxFee, err := strconv.ParseInt(params.MaxFee, 10, 64)
+		if err != nil {
+			return "", ce.NewContractError(ce.ErrInput, "invalid max_fee")
+		}
+		// HIGH #40: reject negative max_fee instead of silently disabling the cap.
+		if maxFee < 0 {
+			return "", ce.NewContractError(ce.ErrInput, "max_fee must be non-negative")
+		}
+		// HIGH #40: maxFee=0 must mean "no fees accepted" — drop the
+		// previous `maxFee > 0 &&` short-circuit so a zero cap can reject
+		// a positive computed fee.
+		if fee > maxFee {
+			return "", ce.NewContractError(ce.ErrInput, "fee exceeds max_fee")
 		}
 	}
 
-	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds
-	totalDeduct := amount + fee
-	if params.DeductFee {
-		totalDeduct = amount
+	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds.
+	// CRIT #3 / W2 SafeAdd64: replace the unchecked `amount + fee` with a
+	// safe-add so the totalDeduct comparison cannot wrap negative.
+	totalDeduct := amount
+	if !params.DeductFee {
+		td, err := SafeAdd64(amount, fee)
+		if err != nil {
+			return "", errors.New("amount+fee overflow")
+		}
+		totalDeduct = td
 	}
 	if GetBalance(caller, "eth") < totalDeduct {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient balance")
@@ -621,7 +644,10 @@ func getTokenInfo(addr [20]byte) *TokenInfo {
 
 func RegisterToken(addr [20]byte, symbol string, decimals uint8, minWithdrawal int64) {
 	key := constants.TokenRegistryPrefix + hex.EncodeToString(addr[:])
-	sdk.StateSetObject(key, symbol+"|"+strconv.FormatUint(uint64(decimals), 10)+"|"+strconv.FormatInt(minWithdrawal, 10))
+	sdk.StateSetObject(
+		key,
+		symbol+"|"+strconv.FormatUint(uint64(decimals), 10)+"|"+strconv.FormatInt(minWithdrawal, 10),
+	)
 }
 
 func requireTssKey() error {
@@ -780,7 +806,7 @@ func HandleIncreaseAllowance(params *AllowanceParams) error {
 	}
 
 	current := GetAllowance(caller, params.Spender, params.Asset)
-	newVal, err := safeAdd64(current, amount)
+	newVal, err := SafeAdd64(current, amount)
 	if err != nil {
 		return ce.WrapContractError(ce.ErrArithmetic, err, "allowance overflow")
 	}
@@ -863,7 +889,14 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
 	}
 
 	// Build 0-value self-transfer to advance nonce
-	unsigned := BuildETHWithdrawalTx(chainId, confirmedNonce, 4_000_000_000, 100_000_000_000, vaultAddress, big.NewInt(0))
+	unsigned := BuildETHWithdrawalTx(
+		chainId,
+		confirmedNonce,
+		4_000_000_000,
+		100_000_000_000,
+		vaultAddress,
+		big.NewInt(0),
+	)
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
