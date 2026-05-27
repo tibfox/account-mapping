@@ -72,3 +72,14 @@ const GasReserveDepositTaxBps = int64(100) // 1% of ETH deposits go to gas reser
 // is now denominated in gwei. Operators calling `setGasReserve` MUST pass
 // gwei values, not wei — see W0 P5 deploy runbook update.
 const MinGasReserve = int64(50_000_000) // 0.05 ETH in GWEI minimum reserve
+
+// W4 Cluster E CRIT #26 + D-E-3 (LOCKED): withdrawal auto-expiry window.
+// EXPIRY_WINDOW = 5000 Hive blocks ≈ 4 hours (Hive 3s blocks). Any L2 caller
+// can submit `expireWithdrawal` once currentBlock >= pending.BlockHeight +
+// WithdrawalExpiryWindow with an L1-proof-of-drop per D-E-4.
+const WithdrawalExpiryWindow uint64 = 5000
+
+// W4 Cluster E §D-E-8 + Cluster B §BG: chain-gate state key set by
+// initContract when IsTestnet=true. clearTestnetState reads this key and
+// aborts if absent or != "true".
+const IsTestnetKey = "is_testnet"
