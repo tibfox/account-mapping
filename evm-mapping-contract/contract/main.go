@@ -308,6 +308,49 @@ func expireProposal(input *string) *string {
 }
 
 // -----------------------------------------------------------------------------
+// W4 Cluster E withdrawal-lifecycle wasmexports.
+// expireWithdrawal: CRIT #26 D-E-3 permissionless after WithdrawalExpiryWindow.
+// cancelMyWithdrawal: CRIT #26 companion (only ps.From + mandatory proof).
+// confirmSpendSchema: CRIT #5 D-E-1 schema introspection for the bot.
+// -----------------------------------------------------------------------------
+
+//go:wasmexport expireWithdrawal
+func expireWithdrawal(input *string) *string {
+	if input == nil || *input == "" {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "expireWithdrawal: empty payload"))
+	}
+	var params mapping.ExpireWithdrawalParams
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "expireWithdrawal: bad payload"))
+	}
+	if err := mapping.HandleExpireWithdrawal(params.Nonce, params.Proof); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+	}
+	return nil
+}
+
+//go:wasmexport cancelMyWithdrawal
+func cancelMyWithdrawal(input *string) *string {
+	if input == nil || *input == "" {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "cancelMyWithdrawal: empty payload"))
+	}
+	var params mapping.CancelMyWithdrawalParams
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "cancelMyWithdrawal: bad payload"))
+	}
+	if err := mapping.HandleCancelMyWithdrawal(params.Nonce, params.Proof, vault(), chainId()); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+	}
+	return nil
+}
+
+//go:wasmexport confirmSpendSchema
+func confirmSpendSchema(_ *string) *string {
+	s := mapping.ConfirmSpendSchemaJSON
+	return &s
+}
+
+// -----------------------------------------------------------------------------
 // dispatchAdmin — invoked from execute() AFTER the timelock has elapsed.
 // W4 Cluster E lifecycle handlers (expireWithdrawal/cancelMyWithdrawal/
 // confirmSpendSchema + clearTestnetState) land in a subsequent commit.
@@ -363,11 +406,19 @@ func dispatchAdmin(action string, payload []byte) {
 
 	case "replaceWithdrawal":
 		assertNotPaused()
-		mapping.HandleReplaceWithdrawal(vault(), chainId())
+		if err := mapping.HandleReplaceWithdrawal(vault(), chainId()); err != nil {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		}
 
 	case "clearNonce":
 		assertNotPaused()
-		mapping.HandleClearNonce(vault(), chainId())
+		var p mapping.ClearNonceParams
+		if err := json.Unmarshal(payload, &p); err != nil {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "clearNonce: bad payload"))
+		}
+		if err := mapping.HandleClearNonce(vault(), chainId(), p.Proof); err != nil {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		}
 
 	// Operational (7.2K blocks, 6h)
 	case "registerToken":
@@ -443,10 +494,11 @@ func dispatchAdmin(action string, payload []byte) {
 		mapping.UnsetRelayer(p.Account)
 
 	case "clearTestnetState":
-		// Stubbed in Cluster C; chain-gated handler arrives in Cluster E
-		// (a subsequent commit). Reject for now so a stray proposal does
-		// not silently no-op.
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "clearTestnetState: awaiting Cluster E handler"))
+		// W4 Cluster E D-E-8 chain-gated handler.
+		assertNotPaused()
+		if err := mapping.HandleClearTestnetState(); err != nil {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
+		}
 
 	// Emergency (Immediate, 0 blocks)
 	case "pause":

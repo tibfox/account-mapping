@@ -168,6 +168,31 @@ func AttachSignature(unsignedTxWithPrefix []byte, v byte, r, s []byte) ([]byte, 
 	return append([]byte{0x02}, signedRLP...), nil
 }
 
+// NonceAdvance — W4 Cluster E §11.1 / D-E-6 LOCKED. Compare-and-set helper
+// shared between HandleClearNonce (CRIT #27) and HandleExpireWithdrawal
+// (CRIT #26). Both paths can advance the confirmed nonce; without a CAS,
+// a same-block race would advance the counter twice and skip a subsequent
+// withdrawal nonce (queue jam).
+//
+// ARCHITECTURAL ASSUMPTION (B-E-3 fix — REQUIRED COMMENT per W4 Step 5):
+// this mutex relies on sequential L2 transaction execution within Magi
+// blocks. If Magi ever introduces concurrent WASM dispatch, this CAS must
+// be replaced with a state-level lock.
+func NonceAdvance(ps *PendingSpend, by uint64) bool {
+	if ps == nil {
+		return false
+	}
+	currentNonce := GetConfirmedNonce()
+	if currentNonce != ps.Nonce {
+		return false
+	}
+	if GetPendingSpend(currentNonce) == nil {
+		return false
+	}
+	SetConfirmedNonce(currentNonce + by)
+	return true
+}
+
 func splitPipe(s string) []string {
 	result := make([]string, 0, 6)
 	start := 0

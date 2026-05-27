@@ -356,6 +356,11 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	return hex.EncodeToString(unsigned), nil
 }
 
+// HandleConfirmSpend — W4 Cluster E CRIT #5 + HIGH #13 (D-E-1 + D-E-2):
+// the request now carries 4 intent fields (IntentNonce/To/Amount/Asset).
+// Entry-point intent binding verifies all 4 match the looked-up
+// PendingSpend BEFORE any proof verification — this is the primary
+// HIGH #13 gate. The downstream tx-proof checks remain as defense-in-depth.
 func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
@@ -365,6 +370,21 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId
 	ps := GetPendingSpend(confirmedNonce)
 	if ps == nil {
 		return errors.New("no pending spend at confirmed nonce")
+	}
+
+	// W4 Cluster E HIGH #13 entry-point intent binding (D-E-2 SERIOUS-1).
+	// These 4 checks fire BEFORE any tx proof verification.
+	if req.IntentNonce != confirmedNonce {
+		return errors.New("intent fields do not match pending spend: nonce")
+	}
+	if req.IntentTo != ps.To {
+		return errors.New("intent fields do not match pending spend: to")
+	}
+	if req.IntentAmount != ps.Amount {
+		return errors.New("intent fields do not match pending spend: amount")
+	}
+	if req.IntentAsset != ps.Asset {
+		return errors.New("intent fields do not match pending spend: asset")
 	}
 
 	if req.BlockHeight <= ps.BlockHeight {
@@ -910,25 +930,35 @@ func HandleDecreaseAllowance(params *AllowanceParams) error {
 	return nil
 }
 
-func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) {
+// HandleReplaceWithdrawal — W4 Cluster E CRIT #27 + HIGH #26:
+//   - now returns error (was void with mid-flow sdk.Revert pre-fix);
+//   - assertNotPaused gate (CRIT #27 pause-guard gap closure);
+//   - HexToAddress error propagated instead of silent 0x0 (HIGH #26).
+func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
 	confirmedNonce := GetConfirmedNonce()
 	ps := GetPendingSpend(confirmedNonce)
 	if ps == nil {
-		sdk.Revert("no pending withdrawal to replace", "replaceWithdrawal")
-		return
+		return errors.New("no pending withdrawal to replace")
 	}
 
 	// Rebuild with 2x gas
 	header := blocklist.GetHeader(blocklist.GetLastHeight())
 	if header == nil {
-		sdk.Revert("no headers", "replaceWithdrawal")
-		return
+		return errors.New("no block headers available")
 	}
 
 	gasTipCap := uint64(4_000_000_000) // doubled
 	gasFeeCap := header.BaseFeePerGas*3 + gasTipCap
 
-	toAddr, _ := crypto.HexToAddress(ps.To)
+	// HIGH #26: surface destination-address parse errors instead of silently
+	// signing a tx to the zero address.
+	toAddr, herr := crypto.HexToAddress(ps.To)
+	if herr != nil {
+		return errors.New("pending spend destination parse failed: " + herr.Error())
+	}
 
 	var unsigned []byte
 	if ps.Asset == "eth" {
@@ -937,7 +967,10 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) {
 		unsigned = BuildETHWithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, toAddr, amountBig)
 	} else {
 		amountBig := new(big.Int).SetInt64(ps.Amount)
-		tokenAddr, _ := crypto.HexToAddress(ps.TokenAddress)
+		tokenAddr, terr := crypto.HexToAddress(ps.TokenAddress)
+		if terr != nil {
+			return errors.New("pending spend token address parse failed: " + terr.Error())
+		}
 		unsigned = BuildERC20WithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
 	}
 
@@ -947,14 +980,29 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) {
 	// Update pending spend with new signed TX
 	ps.UnsignedTxHex = hex.EncodeToString(unsigned)
 	StorePendingSpend(*ps)
+	return nil
 }
 
-func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
+// HandleClearNonce — W4 Cluster E CRIT #27 (B-E-4 + S-E-v17-2):
+//   - takes an L1ProofOfDrop so the proof field is reachable from the
+//     propose/execute payload (pre-fix the wasmexport ignored its
+//     input entirely with `_ *string`);
+//   - assertNotPaused gate (CRIT #27);
+//   - returns error instead of mid-flow sdk.Revert.
+func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
 	confirmedNonce := GetConfirmedNonce()
 	ps := GetPendingSpend(confirmedNonce)
 	if ps == nil {
-		sdk.Revert("no pending nonce to clear", "clearNonce")
-		return
+		return errors.New("no pending nonce to clear")
+	}
+	// L1-proof-of-drop gate: clearNonce previously had no proof anchor at
+	// all. Verify the proof binds the cleared nonce to a reverted-receipt
+	// or block-inclusion-without-tx event on L1.
+	if err := verifyL1ProofOfDrop(&proof, ps, chainId); err != nil {
+		return errors.New("L1ProofOfDrop verify failed: " + err.Error())
 	}
 
 	// Build 0-value self-transfer to advance nonce
@@ -964,8 +1012,6 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
 
 	// Best-effort refund: if the user's balance is at the int64 ceiling we cannot
 	// credit them, but the contract MUST still advance the nonce or it will jam.
-	// Only update supply when the refund actually landed, otherwise balance and
-	// supply diverge.
 	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
 		sup := GetSupply(ps.Asset)
 		sup.Active += ps.Amount
@@ -973,6 +1019,210 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64) {
 		SetSupply(ps.Asset, sup)
 	}
 	DeletePendingSpend(confirmedNonce)
-	SetConfirmedNonce(confirmedNonce + 1)
-	SetPendingNonce(confirmedNonce + 1)
+	// W4 Cluster E §11.1 NonceAdvance CAS — race-safe vs HandleExpireWithdrawal.
+	NonceAdvance(ps, 1)
+	SetPendingNonce(GetConfirmedNonce())
+	sdk.Log("withdrawal_lifecycle " + `{"action":"clearNonce","nonce":` + strconv.FormatUint(confirmedNonce, 10) + `,"from":"` + ps.From + `","proof_type":"` + proof.Type + `"}`)
+	return nil
 }
+
+// HandleExpireWithdrawal — W4 Cluster E CRIT #26 (D-E-3). Permissionless after
+// ps.BlockHeight + WithdrawalExpiryWindow. Pre-window callers MUST supply a
+// proof; post-window opportunistic proof acceptable. Same NonceAdvance CAS.
+func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	ps := GetPendingSpend(nonce)
+	if ps == nil {
+		return errors.New("no pending spend at nonce")
+	}
+	env := sdk.GetEnv()
+	expiryHeight := ps.BlockHeight + constants.WithdrawalExpiryWindow
+	if env.BlockHeight < expiryHeight {
+		// Pre-window: require proof.
+		if proof.Type == "" {
+			return errors.New("expireWithdrawal: proof required before expiry window")
+		}
+		if err := verifyL1ProofOfDrop(&proof, ps, 0); err != nil {
+			return errors.New("L1ProofOfDrop verify failed: " + err.Error())
+		}
+	} else if proof.Type != "" {
+		// Post-window: opportunistic verify.
+		if err := verifyL1ProofOfDrop(&proof, ps, 0); err != nil {
+			return errors.New("L1ProofOfDrop verify failed: " + err.Error())
+		}
+	}
+
+	// Refund + advance.
+	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
+		sup := GetSupply(ps.Asset)
+		sup.Active += ps.Amount
+		sup.User += ps.Amount
+		SetSupply(ps.Asset, sup)
+	}
+	DeletePendingSpend(nonce)
+	NonceAdvance(ps, 1)
+	SetPendingNonce(GetConfirmedNonce())
+	sdk.Log("withdrawal_lifecycle " + `{"action":"expireWithdrawal","nonce":` + strconv.FormatUint(nonce, 10) + `,"from":"` + ps.From + `","caller":"` + env.Caller.String() + `","expired":true}`)
+	return nil
+}
+
+// HandleCancelMyWithdrawal — W4 Cluster E CRIT #26 companion. Only ps.From
+// can call; proof MANDATORY.
+func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [20]byte, chainId uint64) error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	ps := GetPendingSpend(nonce)
+	if ps == nil {
+		return errors.New("no pending spend at nonce")
+	}
+	env := sdk.GetEnv()
+	if env.Caller.String() != ps.From {
+		return errors.New("cancelMyWithdrawal: only the original withdrawer can cancel")
+	}
+	if proof.Type == "" {
+		return errors.New("cancelMyWithdrawal: proof MANDATORY")
+	}
+	if err := verifyL1ProofOfDrop(&proof, ps, chainId); err != nil {
+		return errors.New("L1ProofOfDrop verify failed: " + err.Error())
+	}
+	// TSS-sign self-transfer to roll the L1 vault nonce.
+	unsigned := BuildETHWithdrawalTx(chainId, nonce, 4_000_000_000, 100_000_000_000, vaultAddress, big.NewInt(0))
+	sighash := ComputeSighash(unsigned)
+	sdk.TssSignKey("primary", sighash)
+
+	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
+		sup := GetSupply(ps.Asset)
+		sup.Active += ps.Amount
+		sup.User += ps.Amount
+		SetSupply(ps.Asset, sup)
+	}
+	DeletePendingSpend(nonce)
+	NonceAdvance(ps, 1)
+	SetPendingNonce(GetConfirmedNonce())
+	sdk.Log("withdrawal_lifecycle " + `{"action":"cancelMyWithdrawal","nonce":` + strconv.FormatUint(nonce, 10) + `,"from":"` + ps.From + `","proof_type":"` + proof.Type + `"}`)
+	return nil
+}
+
+// HandleClearTestnetState — W4 Cluster E D-E-8 (chain-gated to testnet via
+// is_testnet state-key sentinel; mainnet redirects unset / != "true" reject).
+func HandleClearTestnetState() error {
+	isTestnet := sdk.StateGetObject(constants.IsTestnetKey)
+	if isTestnet == nil || *isTestnet != "true" {
+		return errors.New("clearTestnetState: not a testnet contract")
+	}
+	// Clear pending spends, nonces, and observed-list within MaxBlockRetention*2.
+	confirmed := GetConfirmedNonce()
+	pending := GetPendingNonce()
+	for n := confirmed; n <= pending; n++ {
+		DeletePendingSpend(n)
+	}
+	sdk.StateDeleteObject(constants.NonceConfirmedKey)
+	sdk.StateDeleteObject(constants.NoncePendingKey)
+	// Observed-list cleanup window.
+	lastH := blocklist.GetLastHeight()
+	startH := uint64(0)
+	if lastH > uint64(constants.MaxBlockRetention*2) {
+		startH = lastH - uint64(constants.MaxBlockRetention*2)
+	}
+	for h := startH; h <= lastH; h++ {
+		sdk.StateDeleteObject(constants.ObservedBlockPrefix + strconv.FormatUint(h, 10))
+	}
+	sdk.Log("clearTestnetState_executed " + `{"action":"clearTestnetState","block_height":` + strconv.FormatUint(lastH, 10) + `}`)
+	return nil
+}
+
+// verifyL1ProofOfDrop — W4 Cluster E D-E-4 LOCKED. Type A: receipt-trie MPT
+// proof + status==0. Type B: tx-trie MPT proof + parsed.Nonce > TxNonce
+// (vault advanced past cleared nonce). Both: blocklist.GetHeader forces
+// block to be ZK-anchored; proof.TxNonce == ps.Nonce.
+func verifyL1ProofOfDrop(proof *L1ProofOfDrop, ps *PendingSpend, chainId uint64) error {
+	if proof == nil || ps == nil {
+		return errors.New("nil proof or pending spend")
+	}
+	if proof.TxNonce != ps.Nonce {
+		return errors.New("proof tx_nonce does not match pending spend nonce")
+	}
+	header := blocklist.GetHeader(proof.BlockHeight)
+	if header == nil {
+		return errors.New("proof block not anchored")
+	}
+	switch proof.Type {
+	case L1ProofTypeRevertedReceipt:
+		receiptBytes, err := hex.DecodeString(proof.ReceiptHex)
+		if err != nil {
+			return errors.New("invalid receipt_hex")
+		}
+		proofBytes, err := hex.DecodeString(proof.ReceiptProofHex)
+		if err != nil {
+			return errors.New("invalid receipt_proof_hex")
+		}
+		proven, err := mpt.VerifyProof(header.ReceiptsRoot, mpt.RLPEncodeKey(proof.TxIndex), splitProofNodes(proofBytes))
+		if err != nil {
+			return errors.New("receipt proof verification failed")
+		}
+		if !bytesEqual(proven, receiptBytes) {
+			return errors.New("receipt does not match proof")
+		}
+		// Parse status: receipt RLP first field after type-byte strip is status.
+		data := receiptBytes
+		if len(data) > 0 && data[0] <= 0x7f {
+			data = data[1:]
+		}
+		items, err := rlp.DecodeList(data)
+		if err != nil || len(items) < 1 {
+			return errors.New("malformed receipt")
+		}
+		if items[0].AsUint64() != 0 {
+			return errors.New("receipt status != 0 — tx not reverted")
+		}
+		return nil
+	case L1ProofTypeBlockInclusion:
+		txBytes, err := hex.DecodeString(proof.TxAtIndexHex)
+		if err != nil {
+			return errors.New("invalid tx_at_index_hex")
+		}
+		proofBytes, err := hex.DecodeString(proof.TxProofHex)
+		if err != nil {
+			return errors.New("invalid tx_proof_hex")
+		}
+		proven, err := mpt.VerifyProof(header.TransactionsRoot, mpt.RLPEncodeKey(proof.TxIndex), splitProofNodes(proofBytes))
+		if err != nil {
+			return errors.New("tx proof verification failed")
+		}
+		if !bytesEqual(proven, txBytes) {
+			return errors.New("tx does not match proof")
+		}
+		parsed, err := parseTransaction(txBytes)
+		if err != nil {
+			return errors.New("failed to parse proven tx: " + err.Error())
+		}
+		if chainId != 0 && parsed.ChainId != chainId {
+			return errors.New("proof tx chain id mismatch")
+		}
+		if parsed.Nonce <= proof.TxNonce {
+			return errors.New("proof tx nonce does not exceed cleared nonce — vault has not advanced")
+		}
+		return nil
+	default:
+		return errors.New("unknown L1ProofOfDrop type: " + proof.Type)
+	}
+}
+
+// ConfirmSpendSchemaJSON — W4 Cluster E CRIT #5 (D-E-1) canonical wire
+// schema for the ConfirmSpendRequest payload (10 top-level fields).
+const ConfirmSpendSchemaJSON = `{"version":1,"type":"ConfirmSpendRequest","fields":[` +
+	`{"name":"block_height","type":"uint64"},` +
+	`{"name":"tx_index","type":"uint64"},` +
+	`{"name":"tx_hex","type":"hex"},` +
+	`{"name":"tx_proof_hex","type":"hex"},` +
+	`{"name":"receipt_hex","type":"hex"},` +
+	`{"name":"receipt_proof_hex","type":"hex"},` +
+	`{"name":"intent_nonce","type":"uint64"},` +
+	`{"name":"intent_to","type":"string"},` +
+	`{"name":"intent_amount","type":"int64"},` +
+	`{"name":"intent_asset","type":"string"}` +
+	`]}`
+
