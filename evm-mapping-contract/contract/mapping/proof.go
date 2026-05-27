@@ -91,9 +91,10 @@ func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte
 		return sender, nil, txHash, errors.New("ecrecover returned zero address")
 	}
 
-	// Mark as observed
-	MarkObserved(req.BlockHeight, txHash, uint16(req.TxIndex))
-
+	// CRIT #8 / W4 Cluster A: MarkObserved is NOT called here. HandleMap
+	// performs MarkObserved AFTER instruction routing + IncBalance + supply
+	// accounting succeed, so a failure later in the pipeline does not
+	// permanently consume the observed slot for this (blockHeight, txHash, idx).
 	return sender, parsedTx.Value, txHash, nil
 }
 
@@ -181,8 +182,9 @@ func VerifyERC20Deposit(
 	// Amount from log.Data (uint256, big-endian)
 	amount := log.Data
 
-	MarkObserved(req.BlockHeight, txHash, uint16(req.LogIndex))
-
+	// CRIT #8 / W4 Cluster A: MarkObserved is NOT called here. The caller
+	// (HandleMap) records the observed slot only after the full deposit
+	// pipeline succeeds.
 	return sender, amount, txHash, nil
 }
 
@@ -194,12 +196,29 @@ func parseTransaction(raw []byte) (*ParsedTx, error) {
 	}
 
 	// EIP-2718 typed transaction: first byte is the type
+	// W4 Cluster A HIGH #41: explicitly enumerate and reject the
+	// currently-unsupported tx types BEFORE the parser falls through —
+	// MUST land BEFORE any downstream state mutation in HandleMap.
 	if raw[0] <= 0x7f {
 		txType := raw[0]
-		if txType == 2 {
+		switch txType {
+		case 1:
+			// EIP-2930 access-list tx — parser not implemented in v1.
+			return nil, errors.New("unsupported tx type 1 (EIP-2930 access list) — only EIP-1559 (type-2) and legacy accepted in v1; type-1/3/4 support deferred to post-launch PR")
+		case 2:
 			return parseEIP1559Tx(raw[1:])
+		case 3:
+			// EIP-4844 blob tx — parser not implemented in v1.
+			return nil, errors.New("unsupported tx type 3 (EIP-4844 blob) — only EIP-1559 (type-2) and legacy accepted in v1; type-1/3/4 support deferred to post-launch PR")
+		case 4:
+			// EIP-7702 set-code (Pectra) — parser not implemented in v1.
+			// HIGH #41: explicit revert here means the deposit is rejected
+			// before any state mutation; type-4 support deferred per
+			// PARTIAL-CLOSES-AND-DEFERRALS item #9.
+			return nil, errors.New("unsupported tx type 4 (EIP-7702 set-code) — only EIP-1559 (type-2) and legacy accepted in v1; type-1/3/4 support deferred to post-launch PR")
+		default:
+			return nil, errors.New("unsupported tx type — only EIP-1559 (type-2) and legacy accepted in v1")
 		}
-		return nil, errors.New("unsupported tx type")
 	}
 
 	// Legacy transaction
