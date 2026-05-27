@@ -28,7 +28,7 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 
 	switch req.DepositType {
 	case "eth":
-		sender, amountBytes, _, err := VerifyETHDeposit(req, vaultAddress)
+		sender, amountBytes, txHash, err := VerifyETHDeposit(req, vaultAddress)
 		if err != nil {
 			return err
 		}
@@ -63,6 +63,10 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 		if err := TrackDeposit("eth", amountInt64, gasTax); err != nil {
 			return err
 		}
+		// CRIT #8 / W4 Cluster A: lock the observed slot only after the
+		// deposit has been fully routed + credited + accounted. If any
+		// earlier step errors, the slot stays open for the next attempt.
+		MarkObserved(req.BlockHeight, txHash, uint16(req.TxIndex))
 		return nil
 
 	case "erc20":
@@ -76,7 +80,7 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 			return ErrInvalidToken
 		}
 
-		sender, amountBytes, _, err := VerifyERC20Deposit(req, vaultAddress, tokenAddr)
+		sender, amountBytes, txHash, err := VerifyERC20Deposit(req, vaultAddress, tokenAddr)
 		if err != nil {
 			return err
 		}
@@ -97,6 +101,9 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 		if err := TrackDeposit(tokenInfo.Symbol, amountInt64, 0); err != nil {
 			return err
 		}
+		// CRIT #8 / W4 Cluster A + CRIT #14 logIndex: lock observed slot
+		// only after routing + credit succeed.
+		MarkObserved(req.BlockHeight, txHash, uint16(req.LogIndex))
 		return nil
 
 	default:
