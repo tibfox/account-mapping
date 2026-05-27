@@ -15,14 +15,41 @@ import (
 	"strconv"
 )
 
-// HandleMap — W4 Cluster B CRIT #6 Sites 1+2+3+10: chainId is now threaded
-// in from the wasmexport so VerifyETHDeposit / VerifyERC20Deposit can
-// cross-check the parsed tx's ChainId field against the contract's
-// configured chainId. Pre-fix the L1 trie proof could be valid AND the
-// parsed tx well-formed yet mined on a different chain — a chain-X tx
-// could be replayed against the chain-Y bridge state. Site 10 also keys
-// the token registry by (chainId, addr) so the same ERC-20 address on a
-// different chain is a distinct registry entry.
+// IsWhitelistedRelayer — W4 Cluster C CRIT #8 native-ETH frontrun mitigation
+// (PARTIAL-CLOSES-AND-DEFERRALS.md item #1, v1 scope): native ETH path
+// requires the caller to be a registered relayer.
+func IsWhitelistedRelayer(account string) bool {
+	if account == "" {
+		return false
+	}
+	data := sdk.StateGetObject(constants.RelayerRegistryPrefix + account)
+	return data != nil && *data == "1"
+}
+
+// SetRelayer / UnsetRelayer write / delete the per-relayer state entry.
+// Called from the propose/execute dispatchAdmin switch in main.go after
+// the operational-class timelock elapses.
+func SetRelayer(account string) {
+	sdk.StateSetObject(constants.RelayerRegistryPrefix+account, "1")
+}
+
+func UnsetRelayer(account string) {
+	sdk.StateDeleteObject(constants.RelayerRegistryPrefix + account)
+}
+
+// AssertNotPaused — exported so main.go dispatchAdmin can gate every
+// migrated handler with this BEFORE business logic, per W1 §D-C-9.
+func AssertNotPaused() error {
+	if isPaused() {
+		return errors.New("contract is paused")
+	}
+	return nil
+}
+
+// HandleMap — W4 Cluster B CRIT #6 Sites 1+2+3+10 + W4 Cluster C CRIT #8:
+// chainId threaded in for wrong-chain reject; native ETH path now also
+// gated by relayer whitelist (ERC-20 stays permissionless because the
+// Transfer-log proof binds depositor cryptographically).
 func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
@@ -35,6 +62,16 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 
 	switch req.DepositType {
 	case "eth":
+		// W4 Cluster C CRIT #8 (v1 relayer whitelist): native ETH has no
+		// cryptographic depositor-to-L1 binding (the L1 tx sender is not
+		// the L2 caller). Gate the path on a registered relayer so a
+		// rogue L2 caller cannot route someone else's deposit. ERC-20
+		// path stays permissionless because the Transfer-log proof binds
+		// the depositor.
+		caller := sdk.GetEnv().Caller.String()
+		if !IsWhitelistedRelayer(caller) {
+			return errors.New("native ETH deposit: caller is not a whitelisted relayer")
+		}
 		// W4 Cluster B CRIT #6 Site 1: chainId passed in so VerifyETHDeposit
 		// can reject wrong-chain txs before any state mutation.
 		sender, amountBytes, txHash, err := VerifyETHDeposit(req, vaultAddress, chainId)
@@ -713,6 +750,13 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		return errors.New("no block headers available")
 	}
 
+	// W4 Cluster C CRIT #7: compute gas pricing up front for BOTH paths so
+	// the reserve floor check applies to ETH-path withdrawals (pre-fix the
+	// floor check was only run on the ERC-20 path; the ETH path skipped it
+	// entirely, drained the vault, and never deducted fees from the owner).
+	gasTipCap := uint64(2_000_000_000)
+	gasFeeCap := header.BaseFeePerGas*2 + gasTipCap
+
 	var tokenAddr [20]byte
 	if params.Asset != "eth" {
 		if params.TokenAddress == "" {
@@ -733,6 +777,12 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		if getGasReserve() < constants.MinGasReserve {
 			return errors.New("insufficient gas reserve for ERC-20 withdrawal")
 		}
+	} else {
+		// W4 Cluster C CRIT #7: ETH path now also enforces the gas reserve
+		// floor + debits (amount + fee) from the owner.
+		if getGasReserve() < constants.MinGasReserve {
+			return errors.New("insufficient gas reserve")
+		}
 	}
 
 	allowance := GetAllowance(params.From, caller, params.Asset)
@@ -740,15 +790,47 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		return errors.New("insufficient allowance")
 	}
 
+	// W4 Cluster C CRIT #7 (ETH path) — compute the gas fee and debit
+	// (amount + fee) instead of just amount. Pre-fix, the ETH path
+	// computed no fee and the vault absorbed the L1 mining cost on every
+	// withdrawal. Route the addition through SafeAdd64 (W2 CRIT #3).
+	totalDeduct := amount
+	if params.Asset == "eth" {
+		feeWei := int64(constants.ETHTransferGas * gasFeeCap)
+		if params.MaxFee != "" {
+			maxFee, perr := strconv.ParseInt(params.MaxFee, 10, 64)
+			if perr != nil {
+				return errors.New("invalid max_fee")
+			}
+			if maxFee < 0 {
+				return errors.New("max_fee must be non-negative")
+			}
+			if feeWei > maxFee {
+				return errors.New("fee exceeds max_fee")
+			}
+		}
+		// Step 3b: gwei conversion before SafeAdd64.
+		fee := feeWei / 1_000_000_000
+		td, addErr := SafeAdd64(amount, fee)
+		if addErr != nil {
+			return errors.New("amount+fee overflow")
+		}
+		totalDeduct = td
+		if params.DeductFee {
+			totalDeduct = amount
+		}
+		if GetBalance(params.From, "eth") < totalDeduct {
+			return errors.New("insufficient balance in owner account")
+		}
+	}
+
 	// All validation passed — now mutate state
-	if !DecBalance(params.From, params.Asset, amount) {
+	if !DecBalance(params.From, params.Asset, totalDeduct) {
 		return errors.New("insufficient balance in owner account")
 	}
 	SetAllowance(params.From, caller, params.Asset, allowance-amount)
 	TrackWithdrawal(params.Asset, amount)
 
-	gasTipCap := uint64(2_000_000_000)
-	gasFeeCap := header.BaseFeePerGas*2 + gasTipCap
 	nonce := GetPendingNonce()
 
 	var unsigned []byte

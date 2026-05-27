@@ -21,6 +21,31 @@ const (
 	VaultAddressKey         = "vault"                // vault ETH address
 	ChainIdKey              = "chainid"              // EVM chain ID
 	VerifierContractIdKey   = "zkverifier"           // ZK header verifier contract ID
+
+	// W4 Cluster C CRIT #9 (D-C-4 / v20 §BI): propose/execute timelock state.
+	// KeyProposalCounter holds the monotonic uint64 proposal id source.
+	// ProposalPrefix builds per-proposal storage keys ("pr-{id}").
+	// The Go constant name AND the literal on-chain state key string for
+	// the counter are both "proposal_next_id" per v20 §BI (resolves
+	// S-C-v19-1 ambiguity — DO NOT shorten to "pc").
+	KeyProposalCounter = "proposal_next_id"
+	ProposalPrefix     = "pr" + DirPathDelimiter // pr-{proposalId} → JSON PendingProposal
+
+	// W4 Cluster C CRIT #8 native ETH relayer whitelist (S-C-v17-2):
+	// per-relayer entry stored under "rl-{hiveAccountName}" → "1".
+	RelayerRegistryPrefix = "rl" + DirPathDelimiter // rl-{hive_account} → "1"
+
+	// W4 Cluster C (v20 §BD): oracle account allowed to call addBlocks
+	// without going through the propose/execute timelock. addBlocks must
+	// remain a high-frequency operational path for the oracle relay; the
+	// account identity itself is what is timelocked via setOracleAccount.
+	OracleAccountKey = "oracle_account"
+
+	// W4 Cluster C: initContract idempotency marker. initContract sets
+	// this to "1" on first successful invocation to make subsequent
+	// initContract calls fail (re-entry guard matching Cluster B §BF
+	// pattern in zk-header-verifier).
+	InitMarkerKey = "init"
 )
 
 const MaxBlockRetention = 101
