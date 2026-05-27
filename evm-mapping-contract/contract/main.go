@@ -61,7 +61,7 @@ func addBlocks(input *string) *string {
 	checkAdmin()
 	var params blocklist.AddBlocksParams
 	json.Unmarshal([]byte(*input), &params)
-	if err := blocklist.HandleAddBlocks(&params); err != nil {
+	if err := blocklist.HandleAddBlocks(&params, chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil
@@ -71,7 +71,7 @@ func addBlocks(input *string) *string {
 func mapDeposit(input *string) *string {
 	var params mapping.MapParams
 	json.Unmarshal([]byte(*input), &params)
-	if err := mapping.HandleMap(&params, vault()); err != nil {
+	if err := mapping.HandleMap(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil
@@ -146,7 +146,7 @@ func registerToken(input *string) *string {
 	if err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "invalid address"))
 	}
-	mapping.RegisterToken(addr, params.Symbol, params.Decimals, params.MinWithdrawal)
+	mapping.RegisterToken(chainId(), addr, params.Symbol, params.Decimals, params.MinWithdrawal)
 	return nil
 }
 
@@ -164,12 +164,12 @@ func setVault(input *string) *string {
 	return nil
 }
 
-//go:wasmexport setChainId
-func setChainIdAction(input *string) *string {
-	checkOwner()
-	sdk.StateSetObject(constants.ChainIdKey, *input)
-	return nil
-}
+// W4 Cluster B CRIT #6 Site 12: setChainId wasmexport REMOVED. The
+// contract's chainId is set once via initContract (and Cluster B's
+// state-key-based read at chainId() above) and is immutable thereafter.
+// A mutable chainId admin handler is the exact CRIT #6 attack surface —
+// re-introducing it via Cluster C admin propose/execute would be a
+// policy reversal and is explicitly forbidden in v18 §AS LOCKED.
 
 //go:wasmexport registerRouter
 func registerRouter(input *string) *string {
@@ -219,7 +219,7 @@ func replaceBlock(input *string) *string {
 	checkAdmin()
 	var params blocklist.AddBlockEntry
 	json.Unmarshal([]byte(*input), &params)
-	if err := blocklist.HandleReplaceBlock(&params); err != nil {
+	if err := blocklist.HandleReplaceBlock(&params, chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil
@@ -291,7 +291,7 @@ func seedBlocks(input *string) *string {
 	}
 	var params blocklist.AddBlockEntry
 	json.Unmarshal([]byte(*input), &params)
-	if err := blocklist.HandleSeedBlock(&params); err != nil {
+	if err := blocklist.HandleSeedBlock(&params, chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil
