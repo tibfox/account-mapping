@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"encoding/json"
 	"errors"
 	"evm-mapping-contract/contract/abi"
 	"evm-mapping-contract/contract/constants"
@@ -41,25 +42,66 @@ func HasPendingWithdrawal() bool {
 	return GetPendingNonce() > GetConfirmedNonce()
 }
 
+// PendingSpend — LOCKED 8-field struct (W1 D-F-3 + W4 Step 3, v19 §AQ + v20 §BE,
+// coordinated with Cluster E). VaultAtQueue is the vault L1 address SNAPSHOT
+// at unmapETH/unmapERC20/unmapFrom queue time, stored as a 0x-prefixed
+// 20-byte hex string. HandleConfirmSpend ecrecovers against this snapshot
+// (NOT the current vault) to close HIGH #29 (setVault orphans pending).
+//
+// Storage format is JSON (v18 §AE migration from pipe-delimited positional).
+// Pre-upgrade pipe-delimited entries are NOT migrated — testnet operators
+// clear all ps-* keys per W0 P0 / Cluster E clearTestnetState before
+// update_contract; mainnet is a fresh deploy so no migration window.
+//
+// TokenAddress is DROPPED (renamed+retyped to VaultAtQueue per W4 Step 3
+// "rename-and-retype, not an addition") — token information for ERC-20
+// receipts is recovered from constants.TxSpendsPrefix entries written
+// by future versions, or via the unsigned tx hex itself. ERC-20 handler
+// path now carries TokenAddress in PendingSpend as well; see field below.
+//
+// W4 Cluster A Step 3b GWEI DENOMINATION (LAUNCH BLOCKER):
+//   - When Asset == "eth", Amount is in GWEI (1 gwei = 1e9 wei). int64 max
+//     in gwei = 9.22e18 gwei = 9.22 BILLION ETH, so HIGH #38 (whale ETH
+//     stuck) is closed. The L1 unsigned tx value is built by multiplying
+//     Amount * 1e9 before BuildETHWithdrawalTx.
+//   - When Asset != "eth" (any ERC-20 / native token), Amount is in the
+//     token-native unit (USDC = 6 decimals). NO scaling applied.
+//   - Sub-gwei dust truncation at deposit time means a whale depositing
+//     20.000_000_001_234_567_890 ETH credits 20_000_000_001 gwei; the
+//     remainder is dropped (Step 3b acknowledged cost).
+//   - Pre-Step-3b PendingSpend entries on testnet would have Amount in
+//     wei; HandleConfirmSpend's L1 verification would 1e9x-mismatch.
+//     Mitigation: clearTestnetState clears all ps-* keys during the
+//     paused upgrade window. Mainnet is a fresh deploy.
 type PendingSpend struct {
-	Nonce        uint64
-	Amount       int64
-	From         string
-	To           string
-	Asset        string
-	TokenAddress string
-	UnsignedTxHex  string
-	BlockHeight  uint64
+	Nonce         uint64 `json:"nonce"`
+	Amount        int64  `json:"amount"`
+	From          string `json:"from"`
+	To            string `json:"to"`
+	Asset         string `json:"asset"`
+	UnsignedTxHex string `json:"unsigned_tx_hex"`
+	BlockHeight   uint64 `json:"block_height"`
+	VaultAtQueue  string `json:"vault_at_queue"`
+	// TokenAddress is kept for ERC-20 confirmSpend validation (the receipt
+	// proof needs to know which token contract the tx targeted). This is
+	// NOT one of the 8 cross-cluster-coordinated fields — it is an
+	// internal contract field and the JSON tag is omitempty so the field
+	// is absent for ETH withdrawals.
+	TokenAddress string `json:"token_address,omitempty"`
 }
 
 func StorePendingSpend(ps PendingSpend) {
 	key := constants.TxSpendsPrefix + strconv.FormatUint(ps.Nonce, 10)
-	data := ps.From + "|" + ps.To + "|" + ps.Asset + "|" +
-		strconv.FormatInt(ps.Amount, 10) + "|" +
-		ps.UnsignedTxHex + "|" +
-		strconv.FormatUint(ps.BlockHeight, 10) + "|" +
-		ps.TokenAddress
-	sdk.StateSetObject(key, data)
+	// v18 §AE: switch from pipe-delimited positional to JSON. Adding the
+	// VaultAtQueue field would silently break the positional parser for
+	// pre-upgrade entries (len(fields)==7 path), so the storage format
+	// changes atomically with the new field.
+	jsonBytes, err := json.Marshal(ps)
+	if err != nil {
+		sdk.Revert("pendingSpend marshal failed", "storePendingSpend")
+		return
+	}
+	sdk.StateSetObject(key, string(jsonBytes))
 }
 
 func GetPendingSpend(nonce uint64) *PendingSpend {
@@ -68,20 +110,15 @@ func GetPendingSpend(nonce uint64) *PendingSpend {
 	if data == nil {
 		return nil
 	}
-	ps := &PendingSpend{Nonce: nonce}
-	fields := splitPipe(*data)
-	if len(fields) < 6 {
+	ps := &PendingSpend{}
+	if err := json.Unmarshal([]byte(*data), ps); err != nil {
+		// Defensive: if a pre-upgrade pipe-delimited entry somehow
+		// survived testnet state clearing, JSON unmarshal will fail.
+		// Returning nil routes the caller to "no pending spend" rather
+		// than silently producing a zero-VaultAtQueue PendingSpend.
 		return nil
 	}
-	ps.From = fields[0]
-	ps.To = fields[1]
-	ps.Asset = fields[2]
-	ps.Amount, _ = strconv.ParseInt(fields[3], 10, 64)
-	ps.UnsignedTxHex = fields[4]
-	ps.BlockHeight, _ = strconv.ParseUint(fields[5], 10, 64)
-	if len(fields) >= 7 {
-		ps.TokenAddress = fields[6]
-	}
+	ps.Nonce = nonce
 	return ps
 }
 
@@ -152,6 +189,44 @@ func AttachSignature(unsignedTxWithPrefix []byte, v byte, r, s []byte) ([]byte, 
 
 	signedRLP := rlp.EncodeList(encodedItems...)
 	return append([]byte{0x02}, signedRLP...), nil
+}
+
+// NonceAdvance — W4 Cluster E §11.1 / D-E-6 LOCKED. Compare-and-set helper
+// shared between HandleClearNonce (CRIT #27) and HandleExpireWithdrawal
+// (CRIT #26). Both paths can advance the confirmed nonce; without a CAS,
+// a same-block race would advance the counter twice and skip a subsequent
+// withdrawal nonce (queue jam).
+//
+// Semantics: nonce advances by `by` IFF GetConfirmedNonce() == ps.Nonce
+// AND the PendingSpend at ps.Nonce still exists in state. If either
+// precondition fails (the other path already won), this is a no-op and
+// returns false. Callers SHOULD treat false as "another handler already
+// advanced — nothing more to do here" — NOT as an error.
+//
+// ARCHITECTURAL ASSUMPTION (B-E-3 fix — REQUIRED COMMENT per W4 Step 5):
+// this mutex relies on sequential L2 transaction execution within Magi
+// blocks. The Magi state engine processes transactions one at a time
+// within a block — two concurrent WASM contract calls CANNOT interleave
+// mid-execution. If Magi ever introduces concurrent WASM dispatch, this
+// CAS must be replaced with a state-level lock (e.g., a "nonce_lock"
+// state key with optimistic concurrency).
+// Source: modules/state-processing/transactions.go (sequential tx
+// dispatch verified by W3-TSS implementation pass).
+func NonceAdvance(ps *PendingSpend, by uint64) bool {
+	if ps == nil {
+		return false
+	}
+	currentNonce := GetConfirmedNonce()
+	if currentNonce != ps.Nonce {
+		return false
+	}
+	// Re-read PendingSpend by nonce; if a concurrent path already deleted
+	// it, treat as "another path advanced first" and become a no-op.
+	if GetPendingSpend(currentNonce) == nil {
+		return false
+	}
+	SetConfirmedNonce(currentNonce + by)
+	return true
 }
 
 func splitPipe(s string) []string {

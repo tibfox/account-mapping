@@ -7,7 +7,20 @@ import (
 )
 
 // RPCTx represents a transaction from eth_getBlockByNumber with hydrated TXs.
+//
+// W4 Cluster A CRIT #1: the monitor's ETH path now fetches raw RLP bytes via
+// eth_getRawTransactionByHash and stores them in `rawWireBytes`. EncodeTx
+// short-circuits to those bytes when present so the tx-trie root we build
+// is byte-identical to what the block producer included — re-encoding from
+// hydrated JSON fields would risk a canonicalisation mismatch on access
+// lists, blob hashes, or v-byte representation. The hydrated-JSON path is
+// retained for tests / non-Path-C consumers.
 type RPCTx struct {
+	// rawWireBytes, when non-nil, is the canonical RLP of the tx as
+	// returned by eth_getRawTransactionByHash. Setting this bypasses the
+	// hydrated-JSON re-encode path entirely.
+	rawWireBytes []byte
+
 	ChainId              string `json:"chainId"`
 	Nonce                string `json:"nonce"`
 	GasPrice             string `json:"gasPrice"`
@@ -40,7 +53,14 @@ type RPCTx struct {
 
 // EncodeTx RLP-encodes a transaction from its JSON fields.
 // Handles all TX types: legacy (0), access list (1), EIP-1559 (2), blob (3), set-code (4).
+//
+// W4 Cluster A CRIT #1: if `rawWireBytes` is set (populated by the monitor
+// after eth_getRawTransactionByHash), return those bytes directly to
+// preserve byte-for-byte parity with the block producer's encoding.
 func EncodeTx(tx *RPCTx) []byte {
+	if len(tx.rawWireBytes) > 0 {
+		return tx.rawWireBytes
+	}
 	txType := HexToUint(tx.Type)
 	switch txType {
 	case 2:

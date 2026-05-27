@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"errors"
 	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/sdk"
 	"strconv"
@@ -43,12 +44,33 @@ func SetSupply(asset string, s Supply) {
 	sdk.StateSetObject(supplyKey(asset), data)
 }
 
-func TrackDeposit(asset string, userAmount, feeAmount int64) {
+// TrackDeposit accumulates per-asset supply totals. Two unguarded int64
+// additions live here per CRIT #3: the inner (userAmount + feeAmount) sum
+// and the (s.Active += ...) accumulator. Both must safe-add — wrapping the
+// accumulator silently corrupts supply forever.
+func TrackDeposit(asset string, userAmount, feeAmount int64) error {
 	s := GetSupply(asset)
-	s.Active += userAmount + feeAmount
-	s.User += userAmount
-	s.Fee += feeAmount
+	delta, err := SafeAdd64(userAmount, feeAmount)
+	if err != nil {
+		return errors.New("TrackDeposit: userAmount+feeAmount overflow")
+	}
+	newActive, err := SafeAdd64(s.Active, delta)
+	if err != nil {
+		return errors.New("TrackDeposit: active accumulator overflow")
+	}
+	newUser, err := SafeAdd64(s.User, userAmount)
+	if err != nil {
+		return errors.New("TrackDeposit: user accumulator overflow")
+	}
+	newFee, err := SafeAdd64(s.Fee, feeAmount)
+	if err != nil {
+		return errors.New("TrackDeposit: fee accumulator overflow")
+	}
+	s.Active = newActive
+	s.User = newUser
+	s.Fee = newFee
 	SetSupply(asset, s)
+	return nil
 }
 
 func TrackWithdrawal(asset string, amount int64) {
