@@ -16,7 +16,15 @@ import (
 	"strconv"
 )
 
-func HandleMap(params *MapParams, vaultAddress [20]byte) error {
+// HandleMap — W4 Cluster B CRIT #6 Sites 1+2+3+10: chainId is now threaded
+// in from the wasmexport so VerifyETHDeposit / VerifyERC20Deposit can
+// cross-check the parsed tx's ChainId field against the contract's
+// configured chainId. Pre-fix the L1 trie proof could be valid AND the
+// parsed tx well-formed yet mined on a different chain — a chain-X tx
+// could be replayed against the chain-Y bridge state. Site 10 also keys
+// the token registry by (chainId, addr) so the same ERC-20 address on a
+// different chain is a distinct registry entry.
+func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 	if isPaused() {
 		return ce.NewContractError(ce.ErrIntent, "contract is paused")
 	}
@@ -28,7 +36,9 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 
 	switch req.DepositType {
 	case "eth":
-		sender, amountBytes, txHash, err := VerifyETHDeposit(req, vaultAddress)
+		// W4 Cluster B CRIT #6 Site 1: chainId passed in so VerifyETHDeposit
+		// can reject wrong-chain txs before any state mutation.
+		sender, amountBytes, txHash, err := VerifyETHDeposit(req, vaultAddress, chainId)
 		if err != nil {
 			return err
 		}
@@ -75,12 +85,15 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 			return ce.Prepend(err, "token address")
 		}
 
-		tokenInfo := getTokenInfo(tokenAddr)
+		// W4 Cluster B CRIT #6 Site 10: token registry keyed by (chainId, addr).
+		tokenInfo := getTokenInfo(chainId, tokenAddr)
 		if tokenInfo == nil {
 			return ErrInvalidToken
 		}
 
-		sender, amountBytes, txHash, err := VerifyERC20Deposit(req, vaultAddress, tokenAddr)
+		// W4 Cluster B CRIT #6 Site 2: chainId threaded so VerifyERC20Deposit
+		// can read the stored header's chainId and cross-check.
+		sender, amountBytes, txHash, err := VerifyERC20Deposit(req, vaultAddress, tokenAddr, chainId)
 		if err != nil {
 			return err
 		}
@@ -265,7 +278,8 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	if err != nil {
 		return "", ce.Prepend(err, "token_address")
 	}
-	tokenInfo := getTokenInfo(tokenAddr)
+	// W4 Cluster B CRIT #6 Site 10: token registry keyed by (chainId, addr).
+	tokenInfo := getTokenInfo(chainId, tokenAddr)
 	if tokenInfo == nil {
 		return "", ErrInvalidToken
 	}
@@ -639,8 +653,18 @@ func isPaused() bool {
 	return data != nil && *data == "1"
 }
 
-func getTokenInfo(addr [20]byte) *TokenInfo {
-	key := constants.TokenRegistryPrefix + hex.EncodeToString(addr[:])
+// getTokenInfo / RegisterToken — W4 Cluster B CRIT #6 Site 10: token
+// registry now keyed by (chainId, addr) so the same ERC-20 address on
+// different chains is a distinct registry entry. Pre-fix the registry
+// was keyed only by addr, so a chainId pivot (or a deploy on a forked
+// testnet) could silently inherit registrations.
+func getTokenInfo(chainId uint64, addr [20]byte) *TokenInfo {
+	key := constants.TokenRegistryPrefix + strconv.FormatUint(
+		chainId,
+		10,
+	) + constants.DirPathDelimiter + hex.EncodeToString(
+		addr[:],
+	)
 	data := sdk.StateGetObject(key)
 	if data == nil {
 		return nil
@@ -661,8 +685,14 @@ func getTokenInfo(addr [20]byte) *TokenInfo {
 	return info
 }
 
-func RegisterToken(addr [20]byte, symbol string, decimals uint8, minWithdrawal int64) {
-	key := constants.TokenRegistryPrefix + hex.EncodeToString(addr[:])
+// RegisterToken — W4 Cluster B CRIT #6 Site 10: store key now includes chainId.
+func RegisterToken(chainId uint64, addr [20]byte, symbol string, decimals uint8, minWithdrawal int64) {
+	key := constants.TokenRegistryPrefix + strconv.FormatUint(
+		chainId,
+		10,
+	) + constants.DirPathDelimiter + hex.EncodeToString(
+		addr[:],
+	)
 	sdk.StateSetObject(
 		key,
 		symbol+"|"+strconv.FormatUint(uint64(decimals), 10)+"|"+strconv.FormatInt(minWithdrawal, 10),
@@ -747,7 +777,8 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		if err != nil {
 			return ce.Prepend(err, "token_address")
 		}
-		tokenInfo := getTokenInfo(tokenAddr)
+		// W4 Cluster B CRIT #6 Site 10: token registry keyed by (chainId, addr).
+		tokenInfo := getTokenInfo(chainId, tokenAddr)
 		if tokenInfo == nil {
 			return ErrInvalidToken
 		}

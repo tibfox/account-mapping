@@ -23,9 +23,15 @@ var WeiPerGwei = big.NewInt(1_000_000_000)
 var (
 	ErrBlockNotFound   = ce.NewContractError(ce.ErrStateAccess, "block header not found")
 	ErrProofFailed     = ce.NewContractError(ce.ErrTransaction, "proof verification failed")
-	ErrNotVaultDeposit = ce.NewContractError(ce.ErrIntent, "transaction is not a deposit to vault")
-	ErrAlreadyObserved = ce.NewContractError(ce.ErrIntent, "deposit already processed")
-	ErrInvalidToken    = ce.NewContractError(ce.ErrIntent, "token not registered")
+	ErrNotVaultDeposit = ce.NewContractError(ce.ErrInput, "transaction is not a deposit to vault")
+	ErrAlreadyObserved = ce.NewContractError(ce.ErrInput, "deposit already processed")
+	ErrInvalidToken    = ce.NewContractError(ce.ErrInput, "token not registered")
+	// W4 Cluster B CRIT #6 Sites 1+2: explicit error for wrong-chain
+	// deposit proofs. The L1 trie proof can be valid AND the parsed tx
+	// can be well-formed, yet the tx may have been mined on a different
+	// chain. Without this check, an attacker could replay a chain-X tx
+	// against the chain-Y bridge state.
+	ErrChainIdMismatch = ce.NewContractError(ce.ErrInput, "tx chain id does not match contract chain id")
 )
 
 // keccak256("Transfer(address,address,uint256)") = ddf252ad...
@@ -33,8 +39,15 @@ var transferEventSigBytes, _ = hex.DecodeString("ddf252ad1be2c89b69c2b068fc378da
 var TransferEventSig = func() [32]byte { var h [32]byte; copy(h[:], transferEventSigBytes); return h }()
 
 // VerifyETHDeposit verifies a native ETH deposit via transaction inclusion proof.
-// Returns the sender address, deposit amount (wei as big-endian bytes), and the tx hash.
-func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte, []byte, [32]byte, error) {
+// Returns the sender address, deposit amount (gwei as big-endian bytes), and the tx hash.
+// W4 Cluster B CRIT #6 Site 1: chainId threaded in so the parsed tx's
+// ChainId field is cross-checked BEFORE ecrecover spends cycles. Pre-fix
+// a chain-X tx could be replayed against the chain-Y bridge state.
+func VerifyETHDeposit(
+	req *VerificationRequest,
+	vaultAddress [20]byte,
+	chainId uint64,
+) ([20]byte, []byte, [32]byte, error) {
 	var sender [20]byte
 	var txHash [32]byte
 
@@ -78,6 +91,14 @@ func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte
 	parsedTx, err := parseTransaction(rawBytes)
 	if err != nil {
 		return sender, nil, txHash, err
+	}
+
+	// W4 Cluster B CRIT #6 Site 1: reject wrong-chain deposit proofs.
+	// trie-proof binds rawBytes -> on-chain root; parseTransaction decodes
+	// ChainId from the canonical RLP; this check rejects cross-chain replay
+	// BEFORE ecrecover spends any cycles.
+	if parsedTx.ChainId != chainId {
+		return sender, nil, txHash, ErrChainIdMismatch
 	}
 
 	// Verify destination is vault
@@ -124,10 +145,14 @@ func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte
 
 // VerifyERC20Deposit verifies an ERC-20 deposit via receipt inclusion proof.
 // Returns the sender address, token amount (big-endian bytes), and the tx hash.
+// W4 Cluster B CRIT #6 Site 2: chainId threaded so the stored header's
+// ChainId field is cross-checked. Pre-fix the receipt-trie proof could be
+// valid but the underlying block could have come from a different chain.
 func VerifyERC20Deposit(
 	req *VerificationRequest,
 	vaultAddress [20]byte,
 	tokenAddr [20]byte,
+	chainId uint64,
 ) ([20]byte, []byte, [32]byte, error) {
 	var sender [20]byte
 	var txHash [32]byte
@@ -135,6 +160,13 @@ func VerifyERC20Deposit(
 	header := blocklist.GetHeader(req.BlockHeight)
 	if header == nil {
 		return sender, nil, txHash, ErrBlockNotFound
+	}
+
+	// W4 Cluster B CRIT #6 Site 2: ERC-20 receipt path reads chainId from
+	// the stored block header (since the receipt itself has no chainId
+	// field). Reject wrong-chain receipts BEFORE any further work.
+	if header.ChainId != chainId {
+		return sender, nil, txHash, ErrChainIdMismatch
 	}
 
 	receiptBytes, err := hex.DecodeString(req.RawHex)
@@ -187,7 +219,7 @@ func VerifyERC20Deposit(
 		return sender, nil, txHash, ce.NewContractError(ce.ErrInput, "insufficient topics for Transfer event")
 	}
 	if log.Topics[0] != TransferEventSig {
-		return sender, nil, txHash, ce.NewContractError(ce.ErrIntent, "not a Transfer event")
+		return sender, nil, txHash, ce.NewContractError(ce.ErrInput, "not a Transfer event")
 	}
 
 	// topics[2] == vault address (padded to 32 bytes)
@@ -200,7 +232,10 @@ func VerifyERC20Deposit(
 	// Sender from topics[1] (padded address)
 	copy(sender[:], log.Topics[1][12:])
 	if sender == ([20]byte{}) {
-		return sender, nil, txHash, ce.NewContractError(ce.ErrIntent, "zero-address sender (mint event, not a deposit)")
+		return sender, nil, txHash, ce.NewContractError(
+			ce.ErrTransaction,
+			"zero-address sender (mint event, not a deposit)",
+		)
 	}
 
 	// Amount from log.Data (uint256, big-endian)
