@@ -148,10 +148,9 @@ func unmapERC20(input *string) *string {
 func confirmSpend(input *string) *string {
 	var req mapping.ConfirmSpendRequest
 	json.Unmarshal([]byte(*input), &req)
-	// W4 Cluster F (in a later commit) will drop the vaultAddress parameter
-	// and read ps.VaultAtQueue instead. For this commit the signature
-	// still takes vault().
-	if err := mapping.HandleConfirmSpend(&req, vault(), chainId()); err != nil {
+	// W4 Cluster F: HandleConfirmSpend signature has NO vaultAddress
+	// parameter — it reads ps.VaultAtQueue from the stored PendingSpend.
+	if err := mapping.HandleConfirmSpend(&req, chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil
@@ -383,11 +382,10 @@ func dispatchAdmin(action string, payload []byte) {
 		sdk.TssCreateKey("primary", "ecdsa", 365)
 
 	case "renewKey":
-		// W4 Cluster F flag 1 lands the body switch to TssRenewKey in a
-		// subsequent commit. Stays as TssCreateKey here for compile parity
-		// with base behavior.
+		// CRIT #17 flag 1 / W4 Cluster F D-F-1: TssRenewKey extends
+		// ExpiryEpoch (NOT TssCreateKey, which would be a no-op).
 		assertNotPaused()
-		sdk.TssCreateKey("primary", "ecdsa", 365)
+		sdk.TssRenewKey("primary", 365)
 
 	// Operator-tactical (28.8K blocks, 24h)
 	case "registerPublicKey":

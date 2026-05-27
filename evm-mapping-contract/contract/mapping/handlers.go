@@ -257,15 +257,19 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	}
 	TrackWithdrawal("eth", amount)
 
-	// Store pending spend
+	// W4 Cluster F D-F-3: snapshot CURRENT vault into VaultAtQueue. When
+	// confirmSpend lands, HandleConfirmSpend ecrecovers against this
+	// snapshot (NOT current vault) — setVault between unmap and
+	// confirmSpend no longer orphans the pending withdrawal (HIGH #29).
 	StorePendingSpend(PendingSpend{
-		Nonce:       nonce,
-		Amount:      amount,
-		From:        caller,
-		To:          params.To,
-		Asset:       "eth",
+		Nonce:         nonce,
+		Amount:        amount,
+		From:          caller,
+		To:            params.To,
+		Asset:         "eth",
 		UnsignedTxHex: hex.EncodeToString(unsigned),
-		BlockHeight: blocklist.GetLastHeight(),
+		BlockHeight:   blocklist.GetLastHeight(),
+		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
 	})
 	SetPendingNonce(nonce + 1)
 
@@ -341,27 +345,33 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 
 	deductGasReserve(gasCost)
 
+	// W4 Cluster F D-F-3: snapshot vault for ERC-20 path too.
 	StorePendingSpend(PendingSpend{
-		Nonce:        nonce,
-		Amount:       amount,
-		From:         caller,
-		To:           params.To,
-		Asset:        tokenInfo.Symbol,
-		TokenAddress: params.TokenAddress,
-		UnsignedTxHex:  hex.EncodeToString(unsigned),
-		BlockHeight:  blocklist.GetLastHeight(),
+		Nonce:         nonce,
+		Amount:        amount,
+		From:          caller,
+		To:            params.To,
+		Asset:         tokenInfo.Symbol,
+		TokenAddress:  params.TokenAddress,
+		UnsignedTxHex: hex.EncodeToString(unsigned),
+		BlockHeight:   blocklist.GetLastHeight(),
+		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
 	})
 	SetPendingNonce(nonce + 1)
 
 	return hex.EncodeToString(unsigned), nil
 }
 
-// HandleConfirmSpend — W4 Cluster E CRIT #5 + HIGH #13 (D-E-1 + D-E-2):
-// the request now carries 4 intent fields (IntentNonce/To/Amount/Asset).
-// Entry-point intent binding verifies all 4 match the looked-up
-// PendingSpend BEFORE any proof verification — this is the primary
-// HIGH #13 gate. The downstream tx-proof checks remain as defense-in-depth.
-func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId uint64) error {
+// HandleConfirmSpend — W4 Cluster F D-F-3 (S-F-v17-2): vaultAddress
+// parameter REMOVED. The handler reads ps.VaultAtQueue directly from
+// the stored PendingSpend (snapshotted at queue time). setVault between
+// unmap and confirmSpend no longer orphans the pending withdrawal —
+// the TSS signature targeting the OLD vault still verifies against the
+// OLD vault (HIGH #29 closure).
+//
+// W4 Cluster E CRIT #5 + HIGH #13 (D-E-1 + D-E-2): the request carries
+// 4 intent fields verified BEFORE proof work (primary HIGH #13 gate).
+func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
 	}
@@ -427,17 +437,24 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId
 		return errors.New("tx chain id does not match contract chain id")
 	}
 
-	// CRIT #11 site 6 (SYSTEM, REJECT): vault TSS-sig recovery. Post
-	// CRIT #24, TSS-lib always produces low-S signatures, so high-S here
-	// signals tampering or replay-with-malleated-sig. Use EcrecoverStrict
-	// so any non-canonical sig is rejected rather than normalized through.
+	// CRIT #11 site 6 (SYSTEM, REJECT) + W4 Cluster F D-F-3 (HIGH #29):
+	// vault TSS-sig recovery against ps.VaultAtQueue (snapshot at unmap
+	// time), NOT the current vault. setVault between unmap and confirmSpend
+	// no longer orphans the pending withdrawal.
+	if ps.VaultAtQueue == "" || ps.VaultAtQueue == "0x0000000000000000000000000000000000000000" {
+		return errors.New("VaultAtQueue is zero — pre-upgrade PendingSpend entry; use clearNonce (with L1-proof-of-drop) or wait for W0 P0 state clearing")
+	}
+	snapshottedVault, err := crypto.HexToAddress(ps.VaultAtQueue)
+	if err != nil {
+		return errors.New("VaultAtQueue parse failed: " + err.Error())
+	}
 	sighash := computeTxSighash(txBytes, parsedTx)
 	recoveredSender, err := crypto.EcrecoverStrict(sighash, 27+parsedTx.V, padTo32(parsedTx.R), padTo32(parsedTx.S))
 	if err != nil {
 		return errors.New("ecrecover failed: " + err.Error())
 	}
-	if recoveredSender != vaultAddress {
-		return errors.New("tx not signed by vault")
+	if recoveredSender != snapshottedVault {
+		return errors.New("tx not signed by vault at queue time")
 	}
 
 	psTo, err := crypto.HexToAddress(ps.To)
@@ -874,15 +891,17 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
+	// W4 Cluster F D-F-3: snapshot vault for HandleUnmapFrom path.
 	StorePendingSpend(PendingSpend{
-		Nonce:        nonce,
-		Amount:       amount,
-		From:         params.From,
-		To:           params.To,
-		Asset:        asset,
-		TokenAddress: tokenAddress,
-		UnsignedTxHex:  hex.EncodeToString(unsigned),
-		BlockHeight:  blocklist.GetLastHeight(),
+		Nonce:         nonce,
+		Amount:        amount,
+		From:          params.From,
+		To:            params.To,
+		Asset:         asset,
+		TokenAddress:  tokenAddress,
+		UnsignedTxHex: hex.EncodeToString(unsigned),
+		BlockHeight:   blocklist.GetLastHeight(),
+		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
 	})
 	SetPendingNonce(nonce + 1)
 	return nil
