@@ -58,7 +58,10 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 				return errors.New("balance overflow")
 			}
 		}
-		TrackDeposit("eth", amountInt64, gasTax)
+		// CRIT #3: TrackDeposit now returns on supply-accumulator overflow.
+		if err := TrackDeposit("eth", amountInt64, gasTax); err != nil {
+			return err
+		}
 		return nil
 
 	case "erc20":
@@ -89,7 +92,10 @@ func HandleMap(params *MapParams, vaultAddress [20]byte) error {
 				return errors.New("balance overflow")
 			}
 		}
-		TrackDeposit(tokenInfo.Symbol, amountInt64, 0)
+		// CRIT #3: TrackDeposit now returns on supply-accumulator overflow.
+		if err := TrackDeposit(tokenInfo.Symbol, amountInt64, 0); err != nil {
+			return err
+		}
 		return nil
 
 	default:
@@ -136,16 +142,32 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	fee := int64(constants.ETHTransferGas * gasFeeCap)
 
 	if params.MaxFee != "" {
-		maxFee, _ := strconv.ParseInt(params.MaxFee, 10, 64)
-		if maxFee > 0 && fee > maxFee {
+		maxFee, err := strconv.ParseInt(params.MaxFee, 10, 64)
+		if err != nil {
+			return "", errors.New("invalid max_fee")
+		}
+		// HIGH #40: reject negative max_fee instead of silently disabling the cap.
+		if maxFee < 0 {
+			return "", errors.New("max_fee must be non-negative")
+		}
+		// HIGH #40: maxFee=0 must mean "no fees accepted" — drop the
+		// previous `maxFee > 0 &&` short-circuit so a zero cap can reject
+		// a positive computed fee.
+		if fee > maxFee {
 			return "", errors.New("fee exceeds max_fee")
 		}
 	}
 
-	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds
-	totalDeduct := amount + fee
-	if params.DeductFee {
-		totalDeduct = amount
+	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds.
+	// CRIT #3 / W2 SafeAdd64: replace the unchecked `amount + fee` with a
+	// safe-add so the totalDeduct comparison cannot wrap negative.
+	totalDeduct := amount
+	if !params.DeductFee {
+		td, err := SafeAdd64(amount, fee)
+		if err != nil {
+			return "", errors.New("amount+fee overflow")
+		}
+		totalDeduct = td
 	}
 	if GetBalance(caller, "eth") < totalDeduct {
 		return "", errors.New("insufficient balance")
@@ -723,7 +745,7 @@ func HandleIncreaseAllowance(params *AllowanceParams) error {
 	}
 
 	current := GetAllowance(caller, params.Spender, params.Asset)
-	newVal, err := safeAdd64(current, amount)
+	newVal, err := SafeAdd64(current, amount)
 	if err != nil {
 		return errors.New("allowance overflow")
 	}
