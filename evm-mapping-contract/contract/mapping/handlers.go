@@ -153,7 +153,7 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	gasTipCap := uint64(2_000_000_000) // 2 gwei
 	// review2 HIGH #16: checked arithmetic — a negative (wrapped) fee here
 	// inflated the user's balance instead of debiting it.
-	gasFeeCap, fee, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
+	gasFeeCap, feeWei, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 	}
@@ -169,11 +169,15 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 		}
 		// HIGH #40: maxFee=0 must mean "no fees accepted" — drop the
 		// previous `maxFee > 0 &&` short-circuit so a zero cap can reject
-		// a positive computed fee.
-		if fee > maxFee {
+		// a positive computed fee. maxFee is quoted in WEI, so compare feeWei.
+		if feeWei > maxFee {
 			return "", ce.NewContractError(ce.ErrInput, "fee exceeds max_fee")
 		}
 	}
+
+	// W4-A Step 3b: safeGasFee returns the fee in WEI; convert to gwei before
+	// mixing with the gwei-denominated amount/balance. Sub-gwei dust truncates.
+	fee := feeWei / 1_000_000_000
 
 	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds.
 	// CRIT #3 / W2 SafeAdd64: replace the unchecked `amount + fee` with a
@@ -191,7 +195,8 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	}
 
 	nonce := GetPendingNonce()
-	amountBig := new(big.Int).SetInt64(amount)
+	// W4-A Step 3b: amount is gwei; the L1 tx value is wei, so scale up.
+	amountBig := new(big.Int).Mul(big.NewInt(amount), WeiPerGwei)
 	unsigned := BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amountBig)
 	sighash := ComputeSighash(unsigned)
 
@@ -309,7 +314,8 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	}
 	TrackWithdrawal(tokenInfo.Symbol, amount)
 
-	deductGasReserve(gasCost)
+	// W4-A Step 3b: gas reserve is gwei; convert the wei gas cost before deducting.
+	deductGasReserve(gasCost / 1_000_000_000)
 
 	StorePendingSpend(PendingSpend{
 		Nonce:         nonce,
@@ -401,8 +407,11 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, vaultAddress [20]byte, chainId
 		if parsedTx.To != psTo {
 			return ce.NewContractError(ce.ErrTransaction, "tx destination does not match pending spend")
 		}
-		txAmount := new(big.Int).SetBytes(parsedTx.Value)
-		if !txAmount.IsInt64() || txAmount.Int64() != ps.Amount {
+		// W4-A Step 3b: tx value is wei; ps.Amount is gwei. Convert with the
+		// same Div as VerifyETHDeposit so the truncation invariant holds.
+		txAmountWei := new(big.Int).SetBytes(parsedTx.Value)
+		txAmountGwei := new(big.Int).Div(txAmountWei, WeiPerGwei)
+		if !txAmountGwei.IsInt64() || txAmountGwei.Int64() != ps.Amount {
 			return ce.NewContractError(ce.ErrTransaction, "tx amount does not match pending spend")
 		}
 	} else {
@@ -771,19 +780,23 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		return ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 	}
 	nonce := GetPendingNonce()
-	amountBig := new(big.Int).SetInt64(amount)
 
 	var unsigned []byte
 	var asset string
 	var tokenAddress string
 	if params.Asset == "eth" {
+		// W4-A Step 3b: ETH amount is gwei; scale to wei for the L1 tx.
+		amountBig := new(big.Int).Mul(big.NewInt(amount), WeiPerGwei)
 		unsigned = BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amountBig)
 		asset = "eth"
 	} else {
+		// ERC-20: token-native units (no gwei scaling).
+		amountBig := new(big.Int).SetInt64(amount)
 		unsigned = BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
 		asset = params.Asset
 		tokenAddress = params.TokenAddress
-		deductGasReserve(gasReserveFee)
+		// W4-A Step 3b: gas reserve is gwei; convert the wei gas cost.
+		deductGasReserve(gasReserveFee / 1_000_000_000)
 	}
 
 	sighash := ComputeSighash(unsigned)
@@ -872,12 +885,14 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) {
 	}
 
 	toAddr, _ := crypto.HexToAddress(ps.To)
-	amountBig := new(big.Int).SetInt64(ps.Amount)
 
 	var unsigned []byte
 	if ps.Asset == "eth" {
+		// W4-A Step 3b: ps.Amount is gwei; scale to wei for the L1 tx.
+		amountBig := new(big.Int).Mul(big.NewInt(ps.Amount), WeiPerGwei)
 		unsigned = BuildETHWithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, toAddr, amountBig)
 	} else {
+		amountBig := new(big.Int).SetInt64(ps.Amount)
 		tokenAddr, _ := crypto.HexToAddress(ps.TokenAddress)
 		unsigned = BuildERC20WithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
 	}

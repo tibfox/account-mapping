@@ -41,6 +41,20 @@ func HasPendingWithdrawal() bool {
 	return GetPendingNonce() > GetConfirmedNonce()
 }
 
+// PendingSpend records the in-flight withdrawal state until confirmSpend or
+// expire/cancel removes the row.
+//
+// W4 Cluster A Step 3b GWEI DENOMINATION (LAUNCH BLOCKER):
+//   - When Asset == "eth", Amount is in GWEI (1 gwei = 1e9 wei). int64 max
+//     in gwei = 9.22e18 gwei = 9.22 BILLION ETH, so HIGH #38 (whale ETH
+//     stuck above 9.22 ETH) is closed without ever bumping to *big.Int.
+//   - ERC-20 amounts (USDC, etc.) stay in token-native units.
+//   - Sub-gwei dust truncation at deposit time means a whale depositing
+//     20.000_000_001_234_567_890 ETH credits 20_000_000_001 gwei; the
+//     remainder is dropped (Step 3b acknowledged cost).
+//   - Pre-Step-3b PendingSpend entries on testnet would have Amount in
+//     wei and silently break confirmSpend; operator must wipe testnet
+//     pending state before redeploy.
 type PendingSpend struct {
 	Nonce        uint64
 	Amount       int64

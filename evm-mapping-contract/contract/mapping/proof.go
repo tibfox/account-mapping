@@ -7,7 +7,18 @@ import (
 	"evm-mapping-contract/contract/crypto"
 	"evm-mapping-contract/contract/mpt"
 	"evm-mapping-contract/contract/rlp"
+	"math/big"
 )
+
+// WeiPerGwei — W4 Cluster A Step 3b gwei scaling. 1 gwei = 1e9 wei.
+// Native ETH amounts cross the contract boundary in wei (L1 native unit) but
+// are stored internally in gwei to expand int64 capacity from 9.22 ETH to
+// 9.22 billion ETH. Conversion uses big.Int.Div which truncates toward zero
+// — sub-gwei dust is silently dropped (≈ $0.000000003 at $3K ETH per
+// truncation). The same Div semantics MUST be used at every conversion
+// boundary so deposit-side and confirmSpend-side truncation match
+// bit-for-bit (see Step 3b "Truncation invariant" in the manifest).
+var WeiPerGwei = big.NewInt(1_000_000_000)
 
 var (
 	ErrBlockNotFound   = ce.NewContractError(ce.ErrStateAccess, "block header not found")
@@ -95,7 +106,20 @@ func VerifyETHDeposit(req *VerificationRequest, vaultAddress [20]byte) ([20]byte
 	// performs MarkObserved AFTER instruction routing + IncBalance + supply
 	// accounting succeed, so a failure later in the pipeline does not
 	// permanently consume the observed slot for this (blockHeight, txHash, idx).
-	return sender, parsedTx.Value, txHash, nil
+	//
+	// W4 Cluster A Step 3b INPUT BOUNDARY (wei -> gwei): convert the parsed
+	// L1 wei amount to gwei before returning. HandleMap stores balances in
+	// gwei (int64 max = 9.22e18 gwei = 9.22 billion ETH), so the boundary
+	// conversion is here. big.Int.Div truncates toward zero — sub-gwei dust
+	// (<1 gwei ≈ $0.000000003) silently disappears. The same Div is used
+	// in HandleConfirmSpend so deposit/withdraw truncation match. Caller
+	// (HandleMap) does NOT re-clamp to int64 — overflow simply cannot fit
+	// in big-endian-encoded bytes at the int64 ceiling, and HandleMap's
+	// big.Int.IsInt64 check catches the upper boundary. We do NOT clamp at
+	// this boundary because the gwei int64 ceiling is unreachable in practice.
+	valueWei := new(big.Int).SetBytes(parsedTx.Value)
+	valueGwei := new(big.Int).Div(valueWei, WeiPerGwei)
+	return sender, valueGwei.Bytes(), txHash, nil
 }
 
 // VerifyERC20Deposit verifies an ERC-20 deposit via receipt inclusion proof.
