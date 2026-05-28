@@ -1275,17 +1275,18 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 			SetSupply(ps.Asset, sup)
 		}
 	}
-	DeletePendingSpend(confirmedNonce)
-	// §11.1 / D-E-6: CAS advance. If expireWithdrawal won the race, this
-	// returns false and we skip the SetConfirmedNonce — the other path
-	// already advanced. Pending-nonce mirror keeps the dispense pointer
-	// in sync regardless.
+	// §11.1 / D-E-6: CAS advance MUST run BEFORE DeletePendingSpend.
+	// NonceAdvance re-reads the PendingSpend by nonce and no-ops if it's
+	// already gone (withdrawal.go:225). Deleting first made NonceAdvance a
+	// permanent no-op, so ConfirmedNonce never advanced and the queue
+	// jammed (review5-split bug #8). Advance first, then delete.
 	if NonceAdvance(ps, 1) {
 		SetPendingNonce(confirmedNonce + 1)
 	} else {
 		// Other path advanced first — re-read and pin np to current n.
 		SetPendingNonce(GetConfirmedNonce())
 	}
+	DeletePendingSpend(confirmedNonce)
 
 	// Audit event (matches Cluster C admin_proposal sdk.Log prefix pattern).
 	sdk.Log("withdrawal_lifecycle {\"action\":\"clearNonce\"," +
@@ -1382,14 +1383,14 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop) error {
 		}
 	}
 
-	DeletePendingSpend(confirmedNonce)
-	// §11.1 / D-E-6 CAS. If clearNonce raced ahead, this returns false
-	// (the other path already advanced) and we skip SetConfirmedNonce.
+	// §11.1 / D-E-6 CAS MUST precede DeletePendingSpend (bug #8): NonceAdvance
+	// re-reads the PendingSpend and no-ops if already deleted. Advance, then delete.
 	if NonceAdvance(ps, 1) {
 		SetPendingNonce(confirmedNonce + 1)
 	} else {
 		SetPendingNonce(GetConfirmedNonce())
 	}
+	DeletePendingSpend(confirmedNonce)
 
 	sdk.Log("withdrawal_lifecycle {\"action\":\"expireWithdrawal\"," +
 		"\"nonce\":" + strconv.FormatUint(confirmedNonce, 10) + "," +
@@ -1463,12 +1464,14 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 			SetSupply(ps.Asset, sup)
 		}
 	}
-	DeletePendingSpend(confirmedNonce)
+	// §11.1 / D-E-6 CAS MUST precede DeletePendingSpend (bug #8): NonceAdvance
+	// re-reads the PendingSpend and no-ops if already deleted. Advance, then delete.
 	if NonceAdvance(ps, 1) {
 		SetPendingNonce(confirmedNonce + 1)
 	} else {
 		SetPendingNonce(GetConfirmedNonce())
 	}
+	DeletePendingSpend(confirmedNonce)
 
 	sdk.Log("withdrawal_lifecycle {\"action\":\"cancelMyWithdrawal\"," +
 		"\"nonce\":" + strconv.FormatUint(confirmedNonce, 10) + "," +
