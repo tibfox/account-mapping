@@ -1122,10 +1122,11 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 		sup.User += ps.Amount
 		SetSupply(ps.Asset, sup)
 	}
-	DeletePendingSpend(confirmedNonce)
-	// W4 Cluster E §11.1 NonceAdvance CAS — race-safe vs HandleExpireWithdrawal.
+	// bug #8: NonceAdvance re-reads the PendingSpend and no-ops once it's
+	// deleted, so advance BEFORE DeletePendingSpend (race-safe vs HandleExpireWithdrawal).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
+	DeletePendingSpend(confirmedNonce)
 	sdk.Log(
 		"withdrawal_lifecycle " + `{"action":"clearNonce","nonce":` + strconv.FormatUint(
 			confirmedNonce,
@@ -1170,9 +1171,10 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop) error {
 		sup.User += ps.Amount
 		SetSupply(ps.Asset, sup)
 	}
-	DeletePendingSpend(nonce)
+	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
+	DeletePendingSpend(nonce)
 	sdk.Log(
 		"withdrawal_lifecycle " + `{"action":"expireWithdrawal","nonce":` + strconv.FormatUint(
 			nonce,
@@ -1213,9 +1215,10 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 		sup.User += ps.Amount
 		SetSupply(ps.Asset, sup)
 	}
-	DeletePendingSpend(nonce)
+	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
+	DeletePendingSpend(nonce)
 	sdk.Log(
 		"withdrawal_lifecycle " + `{"action":"cancelMyWithdrawal","nonce":` + strconv.FormatUint(
 			nonce,
