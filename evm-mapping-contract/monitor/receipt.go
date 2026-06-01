@@ -19,9 +19,10 @@ type RPCReceipt struct {
 
 // RPCLog represents a log entry from a receipt.
 type RPCLog struct {
-	Address string   `json:"address"`
-	Topics  []string `json:"topics"`
-	Data    string   `json:"data"`
+	Address  string   `json:"address"`
+	Topics   []string `json:"topics"`
+	Data     string   `json:"data"`
+	LogIndex string   `json:"logIndex"` // F2: block-level index, used to resolve the per-receipt position
 }
 
 // EncodeReceipt RLP-encodes a receipt in the format Ethereum uses in the receipt trie.

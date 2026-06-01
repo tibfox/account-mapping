@@ -457,22 +457,29 @@ func rawTxBytesAsRPCTxSlice(raws [][]byte) []*RPCTx {
 // rule: find the log whose Address matches the queried token and whose
 // topic[2] (recipient) matches the vault — that log's position inside
 // receipt.Logs is the per-receipt index. Falls back to false if no match.
-func mapBlockLogIdxToPerReceipt(receipt *RPCReceipt, _ int, tokenAddr, vaultLower string) (int, bool) {
+func mapBlockLogIdxToPerReceipt(receipt *RPCReceipt, blockLogIdx int, tokenAddr, vaultLower string) (int, bool) {
 	tokenLower := strings.ToLower(strings.TrimPrefix(tokenAddr, "0x"))
 	vaultPadded := "0x000000000000000000000000" + strings.TrimPrefix(vaultLower, "0x")
 	vaultPaddedLower := strings.ToLower(vaultPadded)
+	// F2: resolve the per-receipt array position of the SPECIFIC block-level
+	// log (matched by its block-level logIndex), NOT the first matching log.
+	// Two Transfer(token -> vault) logs in one tx previously both mapped to
+	// position 0 -> the second deposit collided on IsObserved and was lost.
 	for i, log := range receipt.Logs {
-		if strings.ToLower(strings.TrimPrefix(log.Address, "0x")) != tokenLower {
+		// F2 hardening: omitted logIndex (non-standard RPC) must not silently
+		// match index 0; return false so the caller hard-errors and retries.
+		if log.LogIndex == "" {
+			return 0, false
+		}
+		if int(HexToUint(log.LogIndex)) != blockLogIdx {
 			continue
 		}
-		if len(log.Topics) < 3 {
-			continue
-		}
-		if strings.ToLower(log.Topics[0]) != "0x"+TransferEventSig {
-			continue
-		}
-		if strings.ToLower(log.Topics[2]) != vaultPaddedLower {
-			continue
+		// Sanity-check the resolved log is the expected Transfer(token -> vault).
+		if strings.ToLower(strings.TrimPrefix(log.Address, "0x")) != tokenLower ||
+			len(log.Topics) < 3 ||
+			strings.ToLower(log.Topics[0]) != "0x"+TransferEventSig ||
+			strings.ToLower(log.Topics[2]) != vaultPaddedLower {
+			return 0, false
 		}
 		return i, true
 	}
