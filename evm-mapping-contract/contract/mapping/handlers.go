@@ -1049,43 +1049,76 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 // HandleExpireWithdrawal — W4 Cluster E CRIT #26 (D-E-3). Permissionless after
 // ps.BlockHeight + WithdrawalExpiryWindow. Pre-window callers MUST supply a
 // proof; post-window opportunistic proof acceptable. Same NonceAdvance CAS.
-func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop) error {
+func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
 	}
-	ps := GetPendingSpend(nonce)
+	// F3a (restore review5): only the confirmed-head nonce is expirable. With
+	// the single-outstanding-withdrawal invariant (HasPendingWithdrawal gates
+	// new unmaps), the head is the only live PendingSpend; rejecting non-head
+	// nonces prevents deleting a non-head entry without advancing the head.
+	confirmedNonce := GetConfirmedNonce()
+	if nonce != confirmedNonce {
+		return errors.New("expireWithdrawal: target nonce is not the confirmed-nonce head")
+	}
+	ps := GetPendingSpend(confirmedNonce)
 	if ps == nil {
 		return errors.New("no pending spend at nonce")
 	}
-	env := sdk.GetEnv()
-	expiryHeight := ps.BlockHeight + constants.WithdrawalExpiryWindow
-	if env.BlockHeight < expiryHeight {
-		// Pre-window: require proof.
-		if proof.Type == "" {
-			return errors.New("expireWithdrawal: proof required before expiry window")
-		}
-		if err := verifyL1ProofOfDrop(&proof, ps, 0); err != nil {
-			return errors.New("L1ProofOfDrop verify failed: " + err.Error())
-		}
-	} else if proof.Type != "" {
-		// Post-window: opportunistic verify.
-		if err := verifyL1ProofOfDrop(&proof, ps, 0); err != nil {
-			return errors.New("L1ProofOfDrop verify failed: " + err.Error())
-		}
+	if ps.VaultAtQueue == "" || ps.VaultAtQueue == "0x0000000000000000000000000000000000000000" {
+		return errors.New("legacy PendingSpend entry — clear via admin clearNonce/state procedure")
 	}
 
-	// Refund + advance.
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
+	isOriginalWithdrawer := caller == ps.From
+	expiryHeight := ps.BlockHeight + constants.WithdrawalExpiryWindow
+	hasExpired := env.BlockHeight >= expiryHeight
+
+	// Pre-window: only the original withdrawer may early-cancel. Post-window:
+	// anyone may expire (the window is the gate for WHO).
+	if !hasExpired && !isOriginalWithdrawer {
+		return errors.New("expireWithdrawal: window not elapsed and caller is not original withdrawer")
+	}
+
+	// F3b: an L1-proof-of-drop is MANDATORY in ALL cases — a refund is only
+	// issued against cryptographic proof that the L1 withdrawal did NOT send
+	// funds (type A: reverted receipt; type B: the nonce slot was consumed by
+	// a different tx). Previously the post-window path skipped the proof
+	// entirely, so a withdrawal that SUCCEEDED on L1 but whose confirmSpend
+	// lagged could be refunded on L2 (double-spend). The window governs only
+	// WHO may call, never WHETHER proof is required.
+	//
+	// NOTE (follow-up, not this fix): a genuinely-stuck/never-broadcast
+	// withdrawal (vault nonce never advanced) cannot produce a type-A/B proof
+	// and therefore cannot be expired here — it requires a dedicated
+	// TSS-nonce-roll recovery (consume slot N with a 0-value self-transfer,
+	// THEN refund) so the original tx becomes permanently unmineable. A naive
+	// "nonce-not-advanced" account proof is NOT safe: an in-flight tx can mine
+	// after any proof block, reopening the double-spend. Tracked separately.
+	if proof.Type == "" {
+		return errors.New("expireWithdrawal: L1-proof-of-drop is mandatory (proves the L1 tx did not execute)")
+	}
+	if err := verifyL1ProofOfDrop(&proof, ps, chainId); err != nil {
+		return errors.New("L1ProofOfDrop verify failed: " + err.Error())
+	}
+
+	// Refund + advance (overflow-safe supply restore — review5 parity).
 	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
 		sup := GetSupply(ps.Asset)
-		sup.Active += ps.Amount
-		sup.User += ps.Amount
-		SetSupply(ps.Asset, sup)
+		if newActive, errA := SafeAdd64(sup.Active, ps.Amount); errA == nil {
+			if newUser, errU := SafeAdd64(sup.User, ps.Amount); errU == nil {
+				sup.Active = newActive
+				sup.User = newUser
+				SetSupply(ps.Asset, sup)
+			}
+		}
 	}
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
 	DeletePendingSpend(nonce)
-	sdk.Log("withdrawal_lifecycle " + `{"action":"expireWithdrawal","nonce":` + strconv.FormatUint(nonce, 10) + `,"from":"` + ps.From + `","caller":"` + env.Caller.String() + `","expired":true}`)
+	sdk.Log("withdrawal_lifecycle " + `{"action":"expireWithdrawal","nonce":` + strconv.FormatUint(nonce, 10) + `,"from":"` + ps.From + `","caller":"` + caller + `","proof_type":"` + proof.Type + `"}`)
 	return nil
 }
 
