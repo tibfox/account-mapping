@@ -322,7 +322,7 @@ func expireWithdrawal(input *string) *string {
 	if err := json.Unmarshal([]byte(*input), &params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "expireWithdrawal: bad payload"))
 	}
-	if err := mapping.HandleExpireWithdrawal(params.Nonce, params.Proof); err != nil {
+	if err := mapping.HandleExpireWithdrawal(params.Nonce, params.Proof, chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
 	return nil
