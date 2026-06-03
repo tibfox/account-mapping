@@ -139,7 +139,7 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	gasTipCap := uint64(2_000_000_000) // 2 gwei
 	// review2 HIGH #16: checked arithmetic — a negative (wrapped) fee here
 	// inflated the user's balance instead of debiting it.
-	gasFeeCap, fee, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, gasTipCap)
+	gasFeeCap, fee, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", errors.New("gas fee computation overflow")
 	}
@@ -259,7 +259,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 
 	gasTipCap := uint64(2_000_000_000)
 	// review2 HIGH #16: checked arithmetic (see safeGasFee).
-	gasFeeCap, gasCost, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, gasTipCap)
+	gasFeeCap, gasCost, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", errors.New("gas fee computation overflow")
 	}
@@ -727,7 +727,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	// review2 HIGH #16: checked arithmetic. gasReserveFee replaces the
 	// int64(ERC20TransferGas*gasFeeCap) cast below that could wrap negative
 	// and corrupt the gas reserve via deductGasReserve.
-	gasFeeCap, gasReserveFee, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, gasTipCap)
+	gasFeeCap, gasReserveFee, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return errors.New("gas fee computation overflow")
 	}
@@ -822,7 +822,15 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) {
 	}
 
 	gasTipCap := uint64(4_000_000_000) // doubled
-	gasFeeCap := header.BaseFeePerGas*3 + gasTipCap
+	// review2 HIGH #16: replaceWithdrawal re-prices at 3x base fee. Route the
+	// cap through the checked helper so an extreme base fee can't wrap uint64
+	// into a tiny gasFeeCap and sign an under-priced replacement. gasUnits=0:
+	// no fee is charged here — the reserve was deducted at the original unmap.
+	gasFeeCap, _, feeErr := safeGasFee(0, header.BaseFeePerGas, 3, gasTipCap)
+	if feeErr != nil {
+		sdk.Revert("gas fee cap overflow", "replaceWithdrawal")
+		return
+	}
 
 	toAddr, _ := crypto.HexToAddress(ps.To)
 	amountBig := new(big.Int).SetInt64(ps.Amount)
