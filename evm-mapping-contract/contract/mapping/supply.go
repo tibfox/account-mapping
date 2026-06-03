@@ -73,13 +73,30 @@ func TrackDeposit(asset string, userAmount, feeAmount int64) error {
 	return nil
 }
 
-func TrackWithdrawal(asset string, amount int64) {
+// TrackWithdrawal accumulates per-asset supply totals on the unmap side.
+//
+// review6 M11: pre-fix this only deducted `userAmount` from s.Active, so the
+// fee portion of the original deposit (credited to s.Active in TrackDeposit
+// as part of the userAmount+feeAmount sum) was never debited on the
+// withdrawal that ultimately spent it. Net effect: s.Active drifted upward
+// by feeAmount on every roundtrip — the supply oracle overstated bridged
+// balance, an accounting/insolvency-tracking bug. Track the full debit
+// (user value + L1 fee paid by the contract) so s.Active mirrors the real
+// vault balance.
+//
+// userAmount  — gwei units actually unmapped (will appear on L1).
+// feeOnVault  — gwei units the contract pays the L1 miner ON BEHALF OF the
+//               user. Pass 0 for ERC-20 (gas reserve covers fee separately)
+//               or DeductFee=true ETH (fee is netted from amount upstream).
+func TrackWithdrawal(asset string, userAmount, feeOnVault int64) {
 	s := GetSupply(asset)
-	s.Active -= amount
+	// s.Active reflects total bridged (user + fee component). Deduct both.
+	totalActive := userAmount + feeOnVault
+	s.Active -= totalActive
 	if s.Active < 0 {
 		s.Active = 0
 	}
-	s.User -= amount
+	s.User -= userAmount
 	if s.User < 0 {
 		s.User = 0
 	}
