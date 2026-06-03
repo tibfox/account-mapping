@@ -22,6 +22,8 @@ func Log(s string) {
 // a black hole, getEnv() nil-deref'd). Back them with an in-memory store
 // + settable env so review2 A/B tests can exercise real handler logic.
 // See test helpers (ResetTestState/SetTestCaller/...) at end of file.
+// review6's parallel stub infra (ResetStubState/StubSetEnvJSON) is folded
+// in as aliases over this store — see end of file.
 
 var testState = map[string]string{}
 var testEphem = map[string]string{}
@@ -77,11 +79,36 @@ func hiveTransfer(arg1 *string, arg2 *string, arg3 *string) *string { return nil
 //go:wasmimport sdk hive.withdraw
 func hiveWithdraw(arg1 *string, arg2 *string, arg3 *string) *string { return nil }
 
-//go:wasmimport sdk contracts.read
-func contractRead(contractId *string, key *string) *string { return nil }
+// stubContractReadResponder lets tests intercept contracts.read so external
+// contract reads (e.g. blocklist.readState pulling from the ZK header
+// verifier contract) can be mocked. Returning nil emulates "absent".
+var stubContractReadResponder func(contractId, key string) *string
 
-//go:wasmimport sdk contracts.call
+// StubSetContractReadResponder installs the contracts.read hook. Test-only.
+func StubSetContractReadResponder(fn func(contractId, key string) *string) {
+	stubContractReadResponder = fn
+}
+
+func contractRead(contractId *string, key *string) *string {
+	if stubContractReadResponder != nil {
+		return stubContractReadResponder(*contractId, *key)
+	}
+	return nil
+}
+
+// stubContractCallResponder lets tests intercept contracts.call. Returning
+// nil emulates the host returning nil (call failed). Test-only.
+var stubContractCallResponder func(contractId, method, payload string) *string
+
+// StubSetContractCallResponder installs the contracts.call hook. Test-only.
+func StubSetContractCallResponder(fn func(contractId, method, payload string) *string) {
+	stubContractCallResponder = fn
+}
+
 func contractCall(contractId *string, method *string, payload *string, options *string) *string {
+	if stubContractCallResponder != nil {
+		return stubContractCallResponder(*contractId, *method, *payload)
+	}
 	return nil
 }
 
@@ -207,3 +234,18 @@ func TestStateLen() int { return len(testState) }
 // test files, which predate the review2 harness naming. Both clear the same
 // in-memory store, so it forwards to ResetTestState.
 func ResetTestStateStore() { ResetTestState() }
+
+// ResetStubState is a compatibility alias for the review6 test files, which
+// were written against a parallel stub-infra naming (stubStateStore /
+// ResetStubState). It clears the same in-memory store via ResetTestState and
+// additionally resets the contract call/read responders, matching the
+// review6 semantics.
+func ResetStubState() {
+	ResetTestState()
+	stubContractCallResponder = nil
+	stubContractReadResponder = nil
+}
+
+// StubSetEnvJSON installs the JSON blob `getEnv` should return. Test-only.
+// review6 compatibility alias over the review2 harness's testEnvJSON.
+func StubSetEnvJSON(j string) { testEnvJSON = j }
