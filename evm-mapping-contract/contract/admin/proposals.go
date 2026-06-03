@@ -71,23 +71,24 @@ const (
 //
 // Per W4 §D-C-8 17-handler migration table:
 //   Fund-affecting (Long, 400K):     setVault, setVerifierContract, createKey, renewKey
-//   Operator-tactical (28.8K, 24h):  registerPublicKey, replaceBlock, replaceWithdrawal, clearNonce
+//   Operator-tactical (28.8K, 24h):  registerPublicKey, replaceWithdrawal, clearNonce
 //   Operational (7.2K, 6h):          registerToken, registerRouter, setGasReserve,
-//                                     seedBlocks, setOracleAccount, registerRelayer,
-//                                     deregisterRelayer, clearTestnetState (Cluster E coord)
+//                                     registerRelayer, deregisterRelayer,
+//                                     clearTestnetState (Cluster E coord)
 //   Emergency (0):                   pause, unpause
 //
-// addBlocks is EXEMPT (v20 §BD).
+// review6 H2: addBlocks / seedBlocks / setOracleAccount / replaceBlock are
+//   all REMOVED — headers come from the ZK header-verifier contract only.
+//   See blocklist/blocks.go for rationale.
 // setChainId / adminMint are DROPPED (CRIT #6 / CRIT #9 v10).
 func TimelockFor(action string) (uint64, error) {
 	switch action {
 	case "setVault", "setVerifierContract", "createKey", "renewKey":
 		return TimelockLong, nil
-	case "registerPublicKey", "replaceBlock", "replaceWithdrawal", "clearNonce":
+	case "registerPublicKey", "replaceWithdrawal", "clearNonce":
 		return TimelockTactical, nil
 	case "registerToken", "registerRouter", "setGasReserve",
-		"seedBlocks", "setOracleAccount", "registerRelayer",
-		"deregisterRelayer", "clearTestnetState":
+		"registerRelayer", "deregisterRelayer", "clearTestnetState":
 		return TimelockOperational, nil
 	case "pause", "unpause":
 		return TimelockImmediate, nil
@@ -273,8 +274,8 @@ func ExpireProposal(id uint64, blockHeight uint64, actor string) error {
 // encoded so wallets / SDKs can hand-construct propose calls without
 // double-JSON-encoding the inner struct. Either field can be empty for
 // no-arg actions (pause/unpause/createKey/renewKey/replaceWithdrawal/
-// clearNonce/seedBlocks-with-default-entry — the empty-payload case is
-// allowed and the hash is keccak256(empty bytes) which is a fixed value).
+// clearNonce — the empty-payload case is allowed and the hash is
+// keccak256(empty bytes) which is a fixed value).
 type ProposeRequest struct {
 	Action     string `json:"action"`
 	PayloadHex string `json:"payload_hex"`

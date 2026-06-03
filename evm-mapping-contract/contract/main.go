@@ -6,7 +6,6 @@ package main
 import (
 	"encoding/json"
 	"evm-mapping-contract/contract/admin"
-	"evm-mapping-contract/contract/blocklist"
 	"evm-mapping-contract/contract/constants"
 	ce "evm-mapping-contract/contract/contracterrors"
 	"evm-mapping-contract/contract/crypto"
@@ -70,23 +69,10 @@ func checkOwner() {
 	}
 }
 
-// checkOracleAccount — W4 Cluster C v20 §BD: dedicated gate for `addBlocks`
-// ONLY. Owner accepted too so the pre-setOracleAccount state does not
-// deadlock the oracle feed.
-func checkOracleAccount() {
-	caller := sdk.GetEnv().Caller.String()
-	owner := sdk.GetEnvKey("contract.owner")
-	if owner != nil && caller == *owner {
-		return
-	}
-	oracleAcc := sdk.StateGetObject(constants.OracleAccountKey)
-	if oracleAcc == nil || *oracleAcc == "" {
-		ce.CustomAbort(ce.NewContractError(ce.ErrNoPermission, "addBlocks: oracle account not configured"))
-	}
-	if caller != *oracleAcc {
-		ce.CustomAbort(ce.NewContractError(ce.ErrNoPermission, "addBlocks: oracle account required"))
-	}
-}
+// checkOracleAccount and the OracleAccountKey state slot were removed in
+// review6 H2 (see blocklist/blocks.go for the rationale). They guarded an
+// oracle-trusted addBlocks path that no longer exists — headers come
+// exclusively from the ZK header-verifier contract now.
 
 // assertNotPaused — wraps the dispatchAdmin business logic for every gate
 // touched by the propose/execute migration per W1 §D-C-9.
@@ -118,7 +104,9 @@ func initContract(input *string) *string {
 	if input != nil && *input != "" {
 		_ = json.Unmarshal([]byte(*input), &params)
 	}
-	sdk.StateSetObject(constants.OracleAccountKey, caller)
+	// review6 H2: OracleAccountKey is no longer written at init — the
+	// oracle-fed addBlocks path was removed; headers come from the ZK
+	// header-verifier contract via setVerifierContract.
 	if params.IsTestnet {
 		sdk.StateSetObject("is_testnet", "true")
 	}
@@ -246,19 +234,17 @@ func getInfo(_ *string) *string {
 }
 
 // -----------------------------------------------------------------------------
-// addBlocks — EXEMPT from propose/execute per W1 §D-C-8 (v20 §BD).
+// review6 H2: the `addBlocks` wasmexport (and the underlying
+// blocklist.HandleAddBlocks) was REMOVED. Headers are sourced exclusively
+// from the configured ZK header-verifier contract via the readState
+// indirection in blocklist/blocks.go. See REVIEW6-VALIDATION.md for the
+// architectural rationale (oracle-trusted writes were the unbacked-mint
+// surface that composed with H10/H9/X3/L1).
+//
+// To bootstrap a fresh deployment, deploy the ZK header verifier first
+// and pass its contract id into `execute` via a `setVerifierContract`
+// payload (this path is already gated by the propose/execute timelock).
 // -----------------------------------------------------------------------------
-
-//go:wasmexport addBlocks
-func addBlocks(input *string) *string {
-	checkOracleAccount()
-	var params blocklist.AddBlocksParams
-	unmarshalParams(input, &params)
-	if err := blocklist.HandleAddBlocks(&params, chainId()); err != nil {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
-	}
-	return nil
-}
 
 // -----------------------------------------------------------------------------
 // W4 Cluster C — propose / execute / cancel / expireProposal wasmexports.
@@ -424,16 +410,6 @@ func dispatchAdmin(action string, payload []byte) {
 		assertNotPaused()
 		sdk.StateSetObject(constants.PrimaryPublicKeyKey, string(payload))
 
-	case "replaceBlock":
-		assertNotPaused()
-		var entry blocklist.AddBlockEntry
-		if err := json.Unmarshal(payload, &entry); err != nil {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "replaceBlock: bad payload"))
-		}
-		if err := blocklist.HandleReplaceBlock(&entry, chainId()); err != nil {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
-		}
-
 	case "replaceWithdrawal":
 		assertNotPaused()
 		if err := mapping.HandleReplaceWithdrawal(vault(), chainId()); err != nil {
@@ -471,31 +447,9 @@ func dispatchAdmin(action string, payload []byte) {
 		assertNotPaused()
 		sdk.StateSetObject(constants.GasReserveKey, string(payload))
 
-	case "seedBlocks":
-		assertNotPaused()
-		if blocklist.GetLastHeight() > 0 {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "seedBlocks only allowed when h=0"))
-		}
-		var entry blocklist.AddBlockEntry
-		if err := json.Unmarshal(payload, &entry); err != nil {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "seedBlocks: bad payload"))
-		}
-		if err := blocklist.HandleSeedBlock(&entry, chainId()); err != nil {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
-		}
-
-	case "setOracleAccount":
-		assertNotPaused()
-		var p struct {
-			Account string `json:"account"`
-		}
-		if err := json.Unmarshal(payload, &p); err != nil {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setOracleAccount: bad payload"))
-		}
-		if p.Account == "" {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setOracleAccount: empty account"))
-		}
-		sdk.StateSetObject(constants.OracleAccountKey, p.Account)
+	// review6 H2: `seedBlocks` and `setOracleAccount` cases removed. Header
+	// state is owned by the ZK verifier contract; account-mapping no longer
+	// accepts header writes from any caller (operator or oracle account).
 
 	case "registerRelayer":
 		assertNotPaused()
