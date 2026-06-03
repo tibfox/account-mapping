@@ -95,6 +95,22 @@ func computeGasFeeCap(baseFeePerGas, tipCap uint64) (uint64, error) {
 	return doubled + tipCap, nil
 }
 
+// computeReplaceGasFeeCap is the 3x-baseFee variant used by
+// HandleReplaceWithdrawal for stuck-tx replacement bumps. review6 L1/X3
+// adversarial-review follow-up: the audit's "four fee-multiplication
+// sites" missed this one; route it through the same overflow-checked
+// helper for consistency.
+func computeReplaceGasFeeCap(baseFeePerGas, tipCap uint64) (uint64, error) {
+	if baseFeePerGas > math.MaxUint64/3 {
+		return 0, errors.New("baseFeePerGas overflow (3x)")
+	}
+	tripled := baseFeePerGas * 3
+	if tipCap > math.MaxUint64-tripled {
+		return 0, errors.New("gasFeeCap overflow")
+	}
+	return tripled + tipCap, nil
+}
+
 func balanceKey(address, asset string) string {
 	return constants.BalancePrefix + address + constants.DirPathDelimiter + asset
 }

@@ -681,10 +681,22 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount i
 	dest := did
 	var swapTo, assetOut, destChain string
 
+	// review6 H9 (adversarial-review correction): ALL instruction-driven
+	// destination control is disabled for native ETH. The prior fix only
+	// blocked `deposit_to=`; `swap_to=<attacker>&asset_out=<asset>` was
+	// still honored, dispatching the DEX swap with `Recipient: swapTo` —
+	// equivalent to redirecting the credit. A rogue/compromised
+	// whitelisted relayer can choose any swap_to. params.Instructions is
+	// L2-relayer-supplied (NOT extracted from L1 calldata) so the
+	// depositor never consented.
+	//
+	// ERC-20 keeps all instruction support because the Transfer-log proof
+	// cryptographically binds the L1 depositor — the relayer can't redirect.
 	for _, instr := range instructions {
-		// review6 H9: ETH path ignores deposit_to. ERC-20 path still honors
-		// it because the Transfer-log proof binds the depositor.
-		if asset != "eth" && len(instr) > 11 && instr[:11] == "deposit_to=" {
+		if asset == "eth" {
+			continue
+		}
+		if len(instr) > 11 && instr[:11] == "deposit_to=" {
 			dest = instr[11:]
 		}
 		if len(instr) > 8 && instr[:8] == "swap_to=" {
@@ -1059,8 +1071,17 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 		return errors.New("no block headers available")
 	}
 
+	// review6 L1/X3 (adversarial-review correction): HandleReplaceWithdrawal
+	// was the 5th gas-fee site the audit's "four sites" missed. Route the
+	// (3x baseFee + tip) calculation through the same overflow-checked
+	// helper used in HandleUnmapETH / HandleUnmapERC20 / HandleUnmapFrom.
+	// Dormant after H2 closed the oracle-fed-header surface, but the
+	// arithmetic should still be bounded for defense-in-depth.
 	gasTipCap := uint64(4_000_000_000) // doubled
-	gasFeeCap := header.BaseFeePerGas*3 + gasTipCap
+	gasFeeCap, gfcErr := computeReplaceGasFeeCap(header.BaseFeePerGas, gasTipCap)
+	if gfcErr != nil {
+		return gfcErr
+	}
 
 	// HIGH #26: surface destination-address parse errors instead of silently
 	// signing a tx to the zero address.
@@ -1119,25 +1140,32 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// Best-effort refund: if the user's balance is at the int64 ceiling we cannot
-	// credit them, but the contract MUST still advance the nonce or it will jam.
-	//
-	// review6 L2/X2: route supply restore through SafeAdd64 (matches the
-	// review5-parity comment already present in HandleExpireWithdrawal). On
-	// overflow, leave supply untouched but still advance the nonce — the
-	// invariant the audit flagged was "user not refunded + state advanced"
-	// vs the prior "supply silently wraps to negative + state advanced".
-	// Both branches preserve liveness; the new branch preserves accounting.
-	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-		sup := GetSupply(ps.Asset)
-		if newActive, errA := SafeAdd64(sup.Active, ps.Amount); errA == nil {
-			if newUser, errU := SafeAdd64(sup.User, ps.Amount); errU == nil {
-				sup.Active = newActive
-				sup.User = newUser
-				SetSupply(ps.Asset, sup)
-			}
-		}
+	// review6 X2 (adversarial-review correction): hard-fail if the refund
+	// cannot be credited. Pre-fix the contract silently swallowed an
+	// IncBalance failure (e.g. int64-max overflow on the user's balance)
+	// then advanced the nonce + deleted the PendingSpend unconditionally —
+	// silent user-fund loss. With the hard-fail, the operation aborts
+	// before any state mutates; the user must reduce their existing
+	// balance (transfer out) before retrying clearNonce / expire / cancel.
+	// SafeAdd64 covers the supply accumulators (L2 piece) on the success
+	// path; on failure neither balance nor supply moves and the nonce
+	// stays put, preserving the invariant that "state advanced => user
+	// was refunded".
+	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err != nil {
+		return errors.New("clearNonce: refund would overflow user balance — reduce existing balance first (" + err.Error() + ")")
 	}
+	sup := GetSupply(ps.Asset)
+	newActive, errA := SafeAdd64(sup.Active, ps.Amount)
+	if errA != nil {
+		return errors.New("clearNonce: supply.Active overflow — refund would corrupt accounting")
+	}
+	newUser, errU := SafeAdd64(sup.User, ps.Amount)
+	if errU != nil {
+		return errors.New("clearNonce: supply.User overflow — refund would corrupt accounting")
+	}
+	sup.Active = newActive
+	sup.User = newUser
+	SetSupply(ps.Asset, sup)
 	// bug #8: NonceAdvance re-reads the PendingSpend and no-ops once it's
 	// deleted, so advance BEFORE DeletePendingSpend (race-safe vs HandleExpireWithdrawal).
 	NonceAdvance(ps, 1)
@@ -1204,17 +1232,27 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) e
 		return errors.New("L1ProofOfDrop verify failed: " + err.Error())
 	}
 
-	// Refund + advance (overflow-safe supply restore — review5 parity).
-	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-		sup := GetSupply(ps.Asset)
-		if newActive, errA := SafeAdd64(sup.Active, ps.Amount); errA == nil {
-			if newUser, errU := SafeAdd64(sup.User, ps.Amount); errU == nil {
-				sup.Active = newActive
-				sup.User = newUser
-				SetSupply(ps.Asset, sup)
-			}
-		}
+	// review6 X2 (adversarial-review correction): hard-fail if the refund
+	// cannot be credited. Pre-fix the if-err-nil swallowed an IncBalance
+	// failure and advanced the nonce + deleted the PendingSpend regardless
+	// — silent user-fund loss class. With the hard-fail, the operation
+	// aborts before any state mutates; user must reduce their existing
+	// balance before retrying.
+	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err != nil {
+		return errors.New("expireWithdrawal: refund would overflow user balance — reduce existing balance first (" + err.Error() + ")")
 	}
+	sup := GetSupply(ps.Asset)
+	newActive, errA := SafeAdd64(sup.Active, ps.Amount)
+	if errA != nil {
+		return errors.New("expireWithdrawal: supply.Active overflow — refund would corrupt accounting")
+	}
+	newUser, errU := SafeAdd64(sup.User, ps.Amount)
+	if errU != nil {
+		return errors.New("expireWithdrawal: supply.User overflow — refund would corrupt accounting")
+	}
+	sup.Active = newActive
+	sup.User = newUser
+	SetSupply(ps.Asset, sup)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
@@ -1248,21 +1286,24 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// review6 L2/X2: route supply restore through SafeAdd64 in
-	// HandleCancelMyWithdrawal too, completing the pattern already used in
-	// HandleExpireWithdrawal + (post-this-commit) HandleClearNonce. Same
-	// invariant: liveness preserved on overflow, accounting preserved on
-	// success.
-	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-		sup := GetSupply(ps.Asset)
-		if newActive, errA := SafeAdd64(sup.Active, ps.Amount); errA == nil {
-			if newUser, errU := SafeAdd64(sup.User, ps.Amount); errU == nil {
-				sup.Active = newActive
-				sup.User = newUser
-				SetSupply(ps.Asset, sup)
-			}
-		}
+	// review6 X2 (adversarial-review correction): hard-fail on refund
+	// failure across all three escape-hatch handlers. Matches the new
+	// HandleExpireWithdrawal / HandleClearNonce pattern.
+	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err != nil {
+		return errors.New("cancelMyWithdrawal: refund would overflow user balance — reduce existing balance first (" + err.Error() + ")")
 	}
+	sup := GetSupply(ps.Asset)
+	newActive, errA := SafeAdd64(sup.Active, ps.Amount)
+	if errA != nil {
+		return errors.New("cancelMyWithdrawal: supply.Active overflow — refund would corrupt accounting")
+	}
+	newUser, errU := SafeAdd64(sup.User, ps.Amount)
+	if errU != nil {
+		return errors.New("cancelMyWithdrawal: supply.User overflow — refund would corrupt accounting")
+	}
+	sup.Active = newActive
+	sup.User = newUser
+	SetSupply(ps.Asset, sup)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
