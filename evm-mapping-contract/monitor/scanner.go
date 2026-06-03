@@ -650,7 +650,15 @@ func (s *Scanner) rpcCallWithErrCode(method string, params string) (json.RawMess
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	// review6 closure (M58 / F-MON-3): bound the response body so a
+	// malicious or misconfigured ETH RPC can't OOM the monitor with a
+	// giant reply. 64 MiB is well above any legitimate eth_getBlockByNumber
+	// (busy blocks ≈ few MB).
+	const maxRpcRespBytes = 64 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRpcRespBytes))
+	if err != nil {
+		return nil, 0, fmt.Errorf("rpc response read failed: %w", err)
+	}
 
 	var result struct {
 		Result json.RawMessage `json:"result"`

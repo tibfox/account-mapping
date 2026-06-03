@@ -188,6 +188,13 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	if err != nil {
 		return "", errors.New("invalid 'to' address")
 	}
+	// review6 closure (T2-14 / M70): reject withdrawals to the zero
+	// address. The native-ETH withdrawal would otherwise irrecoverably
+	// burn funds at the EVM precompile null sink. Same guard added below
+	// for ERC-20 and HandleUnmapFrom.
+	if toAddr == ([20]byte{}) {
+		return "", errors.New("withdrawal to zero address rejected")
+	}
 
 	header := blocklist.GetHeader(blocklist.GetLastHeight())
 	if header == nil {
@@ -333,6 +340,11 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	recipientAddr, err := crypto.HexToAddress(params.To)
 	if err != nil {
 		return "", errors.New("invalid recipient address")
+	}
+	// review6 closure (T2-14 / M70): reject ERC-20 withdrawals to zero
+	// address — same fund-burn class as native ETH.
+	if recipientAddr == ([20]byte{}) {
+		return "", errors.New("withdrawal to zero address rejected")
 	}
 
 	header := blocklist.GetHeader(blocklist.GetLastHeight())
@@ -856,6 +868,11 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	toAddr, err := crypto.HexToAddress(params.To)
 	if err != nil {
 		return errors.New("invalid destination address")
+	}
+	// review6 closure (T2-14 / M70): HandleUnmapFrom also needs the
+	// zero-address guard. Same fund-burn class for the meta-tx path.
+	if toAddr == ([20]byte{}) {
+		return errors.New("withdrawal to zero address rejected")
 	}
 
 	header := blocklist.GetHeader(blocklist.GetLastHeight())

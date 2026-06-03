@@ -102,10 +102,20 @@ func initContract(input *string) *string {
 // User-facing wasmexports (NOT admin — no propose/execute wrapping)
 // -----------------------------------------------------------------------------
 
+// review6 closure (T2-10 / LOW-101): every user-facing wasmexport now
+// hard-rejects malformed JSON instead of silently treating it as
+// zero-valued params. Pre-fix a malformed payload would fall through to
+// the handler with default fields (amount=0, addresses=zero, asset="");
+// the handlers then either silently no-op (transfer of 0) or abort with
+// a different, confusing error. The strict gate makes the contract surface
+// fail-loud + fail-uniform.
+
 //go:wasmexport map
 func mapDeposit(input *string) *string {
 	var params mapping.MapParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "map: bad payload"))
+	}
 	if err := mapping.HandleMap(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -115,7 +125,9 @@ func mapDeposit(input *string) *string {
 //go:wasmexport unmapETH
 func unmapETH(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "unmapETH: bad payload"))
+	}
 	if _, err := mapping.HandleUnmapETH(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -125,7 +137,9 @@ func unmapETH(input *string) *string {
 //go:wasmexport unmapERC20
 func unmapERC20(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "unmapERC20: bad payload"))
+	}
 	if _, err := mapping.HandleUnmapERC20(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -135,7 +149,9 @@ func unmapERC20(input *string) *string {
 //go:wasmexport confirmSpend
 func confirmSpend(input *string) *string {
 	var req mapping.ConfirmSpendRequest
-	json.Unmarshal([]byte(*input), &req)
+	if err := json.Unmarshal([]byte(*input), &req); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "confirmSpend: bad payload"))
+	}
 	// W4 Cluster F: HandleConfirmSpend signature has NO vaultAddress
 	// parameter — it reads ps.VaultAtQueue from the stored PendingSpend.
 	if err := mapping.HandleConfirmSpend(&req, chainId()); err != nil {
@@ -147,7 +163,9 @@ func confirmSpend(input *string) *string {
 //go:wasmexport transfer
 func transfer(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "transfer: bad payload"))
+	}
 	if err := mapping.HandleTransfer(&params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -157,7 +175,9 @@ func transfer(input *string) *string {
 //go:wasmexport transferFrom
 func transferFrom(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "transferFrom: bad payload"))
+	}
 	if err := mapping.HandleTransferFrom(&params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -167,7 +187,9 @@ func transferFrom(input *string) *string {
 //go:wasmexport approve
 func approve(input *string) *string {
 	var params mapping.AllowanceParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "approve: bad payload"))
+	}
 	if err := mapping.HandleApprove(&params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -177,7 +199,9 @@ func approve(input *string) *string {
 //go:wasmexport unmapFrom
 func unmapFrom(input *string) *string {
 	var params mapping.TransferParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "unmapFrom: bad payload"))
+	}
 	if err := mapping.HandleUnmapFrom(&params, vault(), chainId()); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -187,7 +211,9 @@ func unmapFrom(input *string) *string {
 //go:wasmexport increaseAllowance
 func increaseAllowance(input *string) *string {
 	var params mapping.AllowanceParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "increaseAllowance: bad payload"))
+	}
 	if err := mapping.HandleIncreaseAllowance(&params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
@@ -197,7 +223,9 @@ func increaseAllowance(input *string) *string {
 //go:wasmexport decreaseAllowance
 func decreaseAllowance(input *string) *string {
 	var params mapping.AllowanceParams
-	json.Unmarshal([]byte(*input), &params)
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "decreaseAllowance: bad payload"))
+	}
 	if err := mapping.HandleDecreaseAllowance(&params); err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error()))
 	}
