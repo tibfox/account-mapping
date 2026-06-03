@@ -1,7 +1,6 @@
 package blocklist
 
 import (
-	"encoding/hex"
 	"errors"
 	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/sdk"
@@ -135,127 +134,58 @@ func GetLastHeight() uint64 {
 	return h
 }
 
-// readState reads from the ZK verifier contract if configured, otherwise from own state.
-// When a verifier contract ID is set, block headers come from the ZK-verified store.
-// Falls back to own state for backward compatibility with the oracle BLS path.
+// readState reads block-header state from the configured ZK header verifier
+// contract.
+//
+// review6 H2: the prior implementation fell back to own state when no
+// verifier was configured ("oracle-trusted" legacy path). That path let a
+// designated oracle account write arbitrary StateRoot / TransactionsRoot /
+// ReceiptsRoot / BaseFeePerGas with no cryptographic anchoring — every
+// finding in the audit's "forged header composes into…" chain (H10, H9,
+// X3, L1) reduced to "oracle key compromise" through this fallback.
+//
+// The fallback is removed: headers MUST come from the ZK verifier. If
+// VerifierContractIdKey is unset OR the verifier returns nothing, GetHeader
+// / GetLastHeight return nil/0 — every consumer (deposit verify, withdrawal
+// fee computation, drop-proof binding) already gracefully handles missing
+// headers by aborting the operation with "no block headers available". The
+// contract simply refuses to process bridge operations until a ZK verifier
+// is wired up, which is the desired safety posture.
 func readState(key string) *string {
 	vcid := sdk.StateGetObject(constants.VerifierContractIdKey)
-	if vcid != nil && *vcid != "" {
-		result := sdk.ContractStateGet(*vcid, key)
-		if result == nil || *result == "" {
-			return nil
-		}
-		return result
+	if vcid == nil || *vcid == "" {
+		return nil
 	}
-	return sdk.StateGetObject(key)
+	result := sdk.ContractStateGet(*vcid, key)
+	if result == nil || *result == "" {
+		return nil
+	}
+	return result
 }
 
 func SetLastHeight(height uint64) {
 	sdk.StateSetObject(constants.LastHeightKey, strconv.FormatUint(height, 10))
 }
 
-type AddBlocksParams struct {
-	Blocks    []AddBlockEntry `json:"blocks"`
-	LatestFee uint64          `json:"latest_fee"`
-}
-
-// AddBlockEntry — W4 Cluster B CRIT #6 Site 4 (legacy-oracle-path schema):
-// extended with `ChainId` so the operator-fed addBlocks/replaceBlock calls
-// (kept during the ZK verifier ramp-up window) can populate the new field.
-// In steady state, headers come from the ZK verifier (no AddBlockEntry path
-// involved); during the ramp-up window, the operator MUST supply chainId
-// matching the contract's configured chainId() — HandleAddBlocks validates
-// this before any StoreHeader, so a mismatched-chain operator submission
-// is rejected at ingestion (defense-in-depth in case the operator wires
-// the wrong ETH RPC).
-type AddBlockEntry struct {
-	BlockNumber      uint64 `json:"block_number"`
-	StateRoot        string `json:"state_root"`
-	TransactionsRoot string `json:"transactions_root"`
-	ReceiptsRoot     string `json:"receipts_root"`
-	BaseFeePerGas    uint64 `json:"base_fee_per_gas"`
-	GasLimit         uint64 `json:"gas_limit"`
-	Timestamp        uint64 `json:"timestamp"`
-	ChainId          uint64 `json:"chain_id"`
-}
-
-// HandleAddBlocks — W4 Cluster B Site 4: chainId now populates the
-// EthBlockHeader.ChainId field on every stored header. Caller (main.go's
-// addBlocks wasmexport) must pass the contract's configured chainId so
-// HandleAddBlocks can validate `entry.ChainId == expectedChainId` before
-// any StoreHeader. Pre-fix, headers stored under the legacy oracle path
-// had no chainId binding; an operator wiring the wrong RPC would silently
-// populate the bridge with cross-chain headers.
-func HandleAddBlocks(params *AddBlocksParams, expectedChainId uint64) error {
-	lastHeight := GetLastHeight()
-
-	if lastHeight == 0 {
-		return errors.New("contract not seeded: call seedBlocks first")
-	}
-
-	for _, entry := range params.Blocks {
-		if entry.BlockNumber != lastHeight+1 {
-			return errors.New("block heights must be sequential")
-		}
-
-		// W4 Cluster B Site 4: chainId guard. Reject any entry whose chainId
-		// does not match the contract's expected chainId. expectedChainId=0
-		// (uninitialized) is also a reject — the contract MUST be configured
-		// before legacy-oracle blocks can be ingested.
-		if expectedChainId == 0 {
-			return errors.New("contract chainId not configured; cannot ingest headers")
-		}
-		if entry.ChainId != expectedChainId {
-			return errors.New("entry chain_id does not match contract chain_id")
-		}
-
-		stateRoot, err := hexTo32(entry.StateRoot)
-		if err != nil {
-			return errors.New("invalid state_root hex")
-		}
-		txRoot, err := hexTo32(entry.TransactionsRoot)
-		if err != nil {
-			return errors.New("invalid transactions_root hex")
-		}
-		rcptRoot, err := hexTo32(entry.ReceiptsRoot)
-		if err != nil {
-			return errors.New("invalid receipts_root hex")
-		}
-
-		header := EthBlockHeader{
-			BlockNumber:      entry.BlockNumber,
-			StateRoot:        stateRoot,
-			TransactionsRoot: txRoot,
-			ReceiptsRoot:     rcptRoot,
-			BaseFeePerGas:    entry.BaseFeePerGas,
-			GasLimit:         entry.GasLimit,
-			Timestamp:        entry.Timestamp,
-			ChainId:          entry.ChainId,
-		}
-
-		StoreHeader(header)
-		lastHeight = entry.BlockNumber
-
-		// Prune old headers
-		if entry.BlockNumber > constants.MaxBlockRetention {
-			pruneHeight := entry.BlockNumber - constants.MaxBlockRetention
-			DeleteHeader(pruneHeight)
-		}
-	}
-
-	SetLastHeight(lastHeight)
-	return nil
-}
-
-func hexTo32(s string) ([32]byte, error) {
-	var result [32]byte
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != 32 {
-		return result, errors.New("invalid 32-byte hex")
-	}
-	copy(result[:], b)
-	return result, nil
-}
+// review6 H2: AddBlockEntry / AddBlocksParams / HandleAddBlocks /
+// HandleSeedBlock / HandleReplaceBlock have been REMOVED. Headers are now
+// sourced exclusively from the configured ZK header-verifier contract
+// (readState routes through VerifierContractIdKey). Any path that lets the
+// operator (or an oracle account) write headers directly into this
+// contract's state is by definition an unbacked-mint surface: the audit's
+// H2 finding showed that forged StateRoot / ReceiptsRoot / BaseFeePerGas
+// composes into H10, H9, X3, L1 — every "this proof verifies against the
+// stored root" check becomes a tautology under operator/oracle compromise.
+// Removing the writer wasmexports and their handlers eliminates the surface
+// entirely. StoreHeader / SetLastHeight / DeleteHeader are kept as
+// private helpers (unused by this package after the H2 cleanup, but
+// retained for the ZK header verifier contract that imports the same
+// blocklist package).
+//
+// If a future operational need for an emergency local-state write arises
+// (e.g. fork recovery without re-deploying), the only acceptable path is
+// to re-add a wasmexport that takes a fresh ZK proof + verifies it inline
+// — never a bare operator-signed header.
 
 func appendUint64(buf []byte, v uint64) []byte {
 	return append(buf,
@@ -271,114 +201,4 @@ func readUint64(buf []byte, offset *int) uint64 {
 		uint64(buf[*offset+6])<<8 | uint64(buf[*offset+7])
 	*offset += 8
 	return v
-}
-
-// HandleSeedBlock — W4 Cluster B Site 4: chainId is required on seed.
-func HandleSeedBlock(entry *AddBlockEntry, expectedChainId uint64) error {
-	if entry.BlockNumber == 0 {
-		return errors.New("seed block_number must be > 0")
-	}
-	if expectedChainId == 0 {
-		return errors.New("contract chainId not configured; cannot seed")
-	}
-	if entry.ChainId != expectedChainId {
-		return errors.New("seed chain_id does not match contract chain_id")
-	}
-	txRoot, err := hexTo32(entry.TransactionsRoot)
-	if err != nil {
-		return errors.New("invalid transactions_root hex")
-	}
-	rcptRoot, err := hexTo32(entry.ReceiptsRoot)
-	if err != nil {
-		return errors.New("invalid receipts_root hex")
-	}
-	header := EthBlockHeader{
-		BlockNumber:      entry.BlockNumber,
-		TransactionsRoot: txRoot,
-		ReceiptsRoot:     rcptRoot,
-		BaseFeePerGas:    entry.BaseFeePerGas,
-		GasLimit:         entry.GasLimit,
-		Timestamp:        entry.Timestamp,
-		ChainId:          entry.ChainId,
-	}
-	StoreHeader(header)
-	SetLastHeight(entry.BlockNumber)
-	return nil
-}
-
-// HandleReplaceBlock — W4 Cluster B Site 4 + W4 Cluster C HIGH #9 / HIGH #35:
-//   - chainId on the replacement entry MUST match the existing stored
-//     header's ChainId. Pre-fix, replaceBlock could silently mutate the
-//     chainId of an in-place header — replaceBlock is an emergency-only
-//     admin operation but a chainId pivot via this path is precisely the
-//     CRIT #6 attack class.
-//   - Reject if either the existing or the new ChainId is 0 (defense
-//     against an unconfigured contract).
-//   - HIGH #9 / HIGH #35 (M9/INV-29): after rewriting the header at the
-//     target height, delete the observed-list state key for that height.
-//     The observed list at `o-{height}` is keyed by (txHash, index) which
-//     validated against the OLD ReceiptsRoot. Replacing the header changes
-//     ReceiptsRoot, so prior observed entries are now binding against a
-//     trie root that the new header no longer commits to. Leaving the
-//     entries stale causes one of two bugs:
-//       (a) a real deposit at the rewritten height fails with
-//           ErrAlreadyObserved against a no-longer-valid prior entry, or
-//       (b) the prior observed entry locks in a deposit that the NEW
-//           ReceiptsRoot would have rejected as invalid.
-//     The observed entries for a block are coalesced under one state key
-//     (mapping/observed.go: `o-{height}` -> concatenated 34-byte entries),
-//     so a single StateDeleteObject deletes them all. Any subsequent
-//     deposit at this height must re-prove against the new header.
-//     KeyDiff includes Deletions (host-runtime guarantees the delete is
-//     part of the same atomic write set as StoreHeader).
-func HandleReplaceBlock(entry *AddBlockEntry, expectedChainId uint64) error {
-	existing := GetHeader(entry.BlockNumber)
-	if existing == nil {
-		return errors.New("block not found for replacement")
-	}
-	if expectedChainId == 0 {
-		return errors.New("contract chainId not configured; cannot replace")
-	}
-	if entry.ChainId != expectedChainId {
-		return errors.New("replacement chain_id does not match contract chain_id")
-	}
-	if existing.ChainId != 0 && existing.ChainId != entry.ChainId {
-		return errors.New("replacement chain_id does not match existing header chain_id")
-	}
-
-	stateRoot, err := hexTo32(entry.StateRoot)
-	if err != nil {
-		return errors.New("invalid state_root hex")
-	}
-	txRoot, err := hexTo32(entry.TransactionsRoot)
-	if err != nil {
-		return errors.New("invalid transactions_root hex")
-	}
-	rcptRoot, err := hexTo32(entry.ReceiptsRoot)
-	if err != nil {
-		return errors.New("invalid receipts_root hex")
-	}
-
-	header := EthBlockHeader{
-		BlockNumber:      entry.BlockNumber,
-		StateRoot:        stateRoot,
-		TransactionsRoot: txRoot,
-		ReceiptsRoot:     rcptRoot,
-		BaseFeePerGas:    entry.BaseFeePerGas,
-		GasLimit:         entry.GasLimit,
-		Timestamp:        entry.Timestamp,
-		ChainId:          entry.ChainId,
-	}
-
-	StoreHeader(header)
-
-	// HIGH #9 / HIGH #35: invalidate observed entries at the rewritten
-	// height. The key format mirrors mapping/observed.go::observedKey:
-	// constants.ObservedBlockPrefix + strconv.FormatUint(height, 10).
-	// We construct the key directly here rather than importing the mapping
-	// package (blocklist must not depend on mapping — mapping already
-	// imports blocklist).
-	observedKey := constants.ObservedBlockPrefix + strconv.FormatUint(entry.BlockNumber, 10)
-	sdk.StateDeleteObject(observedKey)
-	return nil
 }
