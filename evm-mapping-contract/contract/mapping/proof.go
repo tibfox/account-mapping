@@ -2,6 +2,7 @@ package mapping
 
 import (
 	"encoding/hex"
+	"errors"
 	"evm-mapping-contract/contract/blocklist"
 	ce "evm-mapping-contract/contract/contracterrors"
 	"evm-mapping-contract/contract/crypto"
@@ -214,14 +215,32 @@ func VerifyERC20Deposit(
 		return sender, nil, txHash, ce.NewContractError(ce.ErrInput, "not a Transfer event")
 	}
 
-	// topics[2] == vault address (padded to 32 bytes)
+	// topics[2] == vault address (padded to 32 bytes).
+	// review6 closure (WM-CR-7 companion): explicit canonical-encoding
+	// check on the vault topic too. We construct the canonical padded
+	// vault here, so the equality check below already catches non-canon
+	// high bytes; documented for clarity.
 	var vaultPadded [32]byte
 	copy(vaultPadded[12:], vaultAddress[:])
 	if log.Topics[2] != vaultPadded {
 		return sender, nil, txHash, ErrNotVaultDeposit
 	}
 
-	// Sender from topics[1] (padded address)
+	// Sender from topics[1] (padded address).
+	//
+	// review6 closure (WM-CR-7 / F11): an EVM Transfer event topic is a
+	// 32-byte left-zero-padded 20-byte address. The canonical encoding
+	// MUST have topics[1][0:12] == 0. Pre-fix, only the low 20 bytes were
+	// copied — a malformed receipt with non-zero upper 12 bytes would
+	// silently pass through and the sender would be the truncated low
+	// 20 bytes. Reject any non-canonical topic so a forged-receipt path
+	// (oracle-fed pre-H2) can't impersonate the depositor via the unused
+	// upper bytes.
+	for i := 0; i < 12; i++ {
+		if log.Topics[1][i] != 0 {
+			return sender, nil, txHash, errors.New("malformed sender topic: non-zero high bytes")
+		}
+	}
 	copy(sender[:], log.Topics[1][12:])
 	if sender == ([20]byte{}) {
 		return sender, nil, txHash, ce.NewContractError(
@@ -417,14 +436,28 @@ func parseReceiptLogs(receiptRLP []byte) ([]ParsedLog, error) {
 	if len(items) < 4 {
 		return nil, ce.NewContractError(ce.ErrInput, "invalid receipt: too few fields")
 	}
+	// review6 closure (WM-CR-10 / M71): reject receipts whose status field
+	// is not 1 (success). EVM receipts from reverted txs may still carry
+	// logs from partially-executed inner frames; parsing them and using
+	// them in deposit verification is an audit-flagged surface. Drop
+	// status!=1 here so no downstream caller has to remember to check.
+	status := items[0].AsUint64()
+	if status != 1 {
+		return nil, errors.New("receipt status != success (reverted or missing)")
+	}
 	if !items[3].IsList {
 		return nil, ce.NewContractError(ce.ErrInput, "receipt logs should be a list")
 	}
 
 	logs := make([]ParsedLog, 0, len(items[3].Children))
 	for _, logItem := range items[3].Children {
+		// review6 closure (LOW-5 / F15): a malformed log entry shifts
+		// subsequent LogIndex positions and silently confuses
+		// LogIndex-keyed dedup. Hard-reject the whole receipt rather
+		// than skipping the bad entry. Strictness is correct here —
+		// any well-formed receipt has well-formed log entries.
 		if !logItem.IsList || len(logItem.Children) < 3 {
-			continue
+			return nil, errors.New("malformed log entry in receipt")
 		}
 		var pl ParsedLog
 		addrBytes := logItem.Children[0].AsBytes()

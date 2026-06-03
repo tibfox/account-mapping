@@ -118,6 +118,13 @@ func initContract(input *string) *string {
 // User-facing wasmexports (NOT admin — no propose/execute wrapping)
 // -----------------------------------------------------------------------------
 
+// review6 closure (T2-10 / LOW-101): every user-facing wasmexport must
+// hard-reject malformed JSON instead of silently treating it as
+// zero-valued params. On this base the invariant is provided by the
+// canonical unmarshalParams helper (pentest F2 fix, above), which also
+// nil-checks the input and tags parse failures with ErrJson — so the
+// per-export inline gates from the review6 commit are unnecessary.
+
 //go:wasmexport map
 func mapDeposit(input *string) *string {
 	var params mapping.MapParams

@@ -177,6 +177,7 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	}
 	// review2 #44: the zero address parses as a valid [20]byte; a
 	// TSS-signed withdrawal to 0x000…0 burns the funds irrecoverably.
+	// (Also review6 closure T2-14 / M70 — same finding, single guard suffices.)
 	if toAddr == ([20]byte{}) {
 		return "", ce.NewContractError(ce.ErrInput, "refusing withdrawal to zero address")
 	}
@@ -321,6 +322,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 		return "", ce.Prepend(err, "recipient address")
 	}
 	// review2 #44: refuse the zero address (TSS-signed burn).
+	// (Also review6 closure T2-14 / M70 — same finding, single guard suffices.)
 	if recipientAddr == ([20]byte{}) {
 		return "", ce.NewContractError(ce.ErrInput, "refusing withdrawal to zero address")
 	}
@@ -859,6 +861,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		return ce.Prepend(err, "destination address")
 	}
 	// review2 #44: refuse the zero address (TSS-signed burn).
+	// (Also review6 closure T2-14 / M70 — same finding, single guard suffices.)
 	if toAddr == ([20]byte{}) {
 		return ce.NewContractError(ce.ErrInput, "refusing withdrawal to zero address")
 	}
