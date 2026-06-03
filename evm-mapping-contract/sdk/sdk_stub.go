@@ -16,26 +16,77 @@ func Log(s string) {
 	log(&s)
 }
 
-//go:wasmimport sdk db.set_object
-func stateSetObject(key *string, value *string) *string { return nil }
+// In-memory persistent state for non-wasm (test) builds. Production builds
+// use the gc.custom variant in runtime_imports.go which delegates to host
+// imports. Keeping a real store here lets unit tests in `contract/mapping`
+// exercise stateful helpers (GetSupply/SetSupply, getGasReserve, GetBalance,
+// etc.) end-to-end without standing up a full devnet.
+var stubStateStore = map[string]string{}
 
-//go:wasmimport sdk db.get_object
-func stateGetObject(key *string) *string { return nil }
+// ResetStubState clears the in-memory store. Test-only helper.
+func ResetStubState() {
+	for k := range stubStateStore {
+		delete(stubStateStore, k)
+	}
+	for k := range stubEphemStore {
+		delete(stubEphemStore, k)
+	}
+	stubEnvJSON = `{"contract.id":"vsc1stub","tx.id":"","tx.index":0,"tx.op_index":0,"block.id":"","block.height":0,"block.timestamp":"","msg.sender":"hive:stubcaller","msg.caller":"hive:stubcaller","msg.payer":"hive:stubcaller","msg.required_auths":[],"msg.required_posting_auths":[],"sender":{},"intents":[]}`
+	stubContractCallResponder = nil
+	stubContractReadResponder = nil
+}
 
-//go:wasmimport sdk db.rm_object
-func stateDeleteObject(key *string) *string { return nil }
+func stateSetObject(key *string, value *string) *string {
+	stubStateStore[*key] = *value
+	return nil
+}
 
-//go:wasmimport sdk ephem_db.set_object
-func ephemStateSetObject(key *string, value *string) *string { return nil }
+func stateGetObject(key *string) *string {
+	v, ok := stubStateStore[*key]
+	if !ok {
+		return nil
+	}
+	return &v
+}
 
-//go:wasmimport sdk ephem_db.get_object
-func ephemStateGetObject(contractId *string, key *string) *string { return nil }
+func stateDeleteObject(key *string) *string {
+	delete(stubStateStore, *key)
+	return nil
+}
 
-//go:wasmimport sdk ephem_db.rm_object
-func ephemStateDeleteObject(key *string) *string { return nil }
+var stubEphemStore = map[string]string{}
 
-//go:wasmimport sdk system.get_env
-func getEnv(arg *string) *string { return nil }
+func ephemStateSetObject(key *string, value *string) *string {
+	stubEphemStore[*key] = *value
+	return nil
+}
+
+func ephemStateGetObject(contractId *string, key *string) *string {
+	v, ok := stubEphemStore[*key]
+	if !ok {
+		return nil
+	}
+	return &v
+}
+
+func ephemStateDeleteObject(key *string) *string {
+	delete(stubEphemStore, *key)
+	return nil
+}
+
+// stubEnvJSON is the JSON blob returned by `system.get_env` in stub mode.
+// Tests can override via StubSetEnvJSON. A sensible default is populated so
+// helpers that touch GetEnv (e.g. routeDeposit's swap branch) work out of
+// the box without test boilerplate.
+var stubEnvJSON = `{"contract.id":"vsc1stub","tx.id":"","tx.index":0,"tx.op_index":0,"block.id":"","block.height":0,"block.timestamp":"","msg.sender":"hive:stubcaller","msg.caller":"hive:stubcaller","msg.payer":"hive:stubcaller","msg.required_auths":[],"msg.required_posting_auths":[],"sender":{},"intents":[]}`
+
+// StubSetEnvJSON installs the JSON blob `getEnv` should return. Test-only.
+func StubSetEnvJSON(j string) { stubEnvJSON = j }
+
+func getEnv(arg *string) *string {
+	out := stubEnvJSON
+	return &out
+}
 
 //go:wasmimport sdk system.get_env_key
 func getEnvKey(arg *string) *string { return nil }
@@ -58,11 +109,36 @@ func hiveTransfer(arg1 *string, arg2 *string, arg3 *string) *string { return nil
 //go:wasmimport sdk hive.withdraw
 func hiveWithdraw(arg1 *string, arg2 *string, arg3 *string) *string { return nil }
 
-//go:wasmimport sdk contracts.read
-func contractRead(contractId *string, key *string) *string { return nil }
+// stubContractReadResponder lets tests intercept contracts.read so external
+// contract reads (e.g. blocklist.readState pulling from the ZK header
+// verifier contract) can be mocked. Returning nil emulates "absent".
+var stubContractReadResponder func(contractId, key string) *string
 
-//go:wasmimport sdk contracts.call
+// StubSetContractReadResponder installs the contracts.read hook. Test-only.
+func StubSetContractReadResponder(fn func(contractId, key string) *string) {
+	stubContractReadResponder = fn
+}
+
+func contractRead(contractId *string, key *string) *string {
+	if stubContractReadResponder != nil {
+		return stubContractReadResponder(*contractId, *key)
+	}
+	return nil
+}
+
+// stubContractCallResponder lets tests intercept contracts.call. Returning
+// nil emulates the host returning nil (call failed). Test-only.
+var stubContractCallResponder func(contractId, method, payload string) *string
+
+// StubSetContractCallResponder installs the contracts.call hook. Test-only.
+func StubSetContractCallResponder(fn func(contractId, method, payload string) *string) {
+	stubContractCallResponder = fn
+}
+
 func contractCall(contractId *string, method *string, payload *string, options *string) *string {
+	if stubContractCallResponder != nil {
+		return stubContractCallResponder(*contractId, *method, *payload)
+	}
 	return nil
 }
 
