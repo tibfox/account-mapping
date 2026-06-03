@@ -62,6 +62,11 @@ func safeGasFee(gasUnits, baseFeePerGas, multiplier, gasTipCap uint64) (uint64, 
 // cannot overflow, so the int64 overflow guards the audit asked for are
 // structurally unnecessary here.
 
+// review6 L1/X3 5th-site note: HandleReplaceWithdrawal's 3x re-price (the
+// site the audit's "four sites" list missed) routes through safeGasFee with
+// multiplier=3, so the separate computeReplaceGasFeeCap helper from the
+// adversarial-review commit is unnecessary on this base.
+
 func balanceKey(address, asset string) string {
 	return constants.BalancePrefix + address + constants.DirPathDelimiter + asset
 }

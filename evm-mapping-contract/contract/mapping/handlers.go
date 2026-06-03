@@ -679,10 +679,22 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount *
 	dest := did
 	var swapTo, assetOut, destChain string
 
+	// review6 H9 (adversarial-review correction): ALL instruction-driven
+	// destination control is disabled for native ETH. The prior fix only
+	// blocked `deposit_to=`; `swap_to=<attacker>&asset_out=<asset>` was
+	// still honored, dispatching the DEX swap with `Recipient: swapTo` —
+	// equivalent to redirecting the credit. A rogue/compromised
+	// whitelisted relayer can choose any swap_to. params.Instructions is
+	// L2-relayer-supplied (NOT extracted from L1 calldata) so the
+	// depositor never consented.
+	//
+	// ERC-20 keeps all instruction support because the Transfer-log proof
+	// cryptographically binds the L1 depositor — the relayer can't redirect.
 	for _, instr := range instructions {
-		// review6 H9: ETH path ignores deposit_to. ERC-20 path still honors
-		// it because the Transfer-log proof binds the depositor.
-		if asset != "eth" && len(instr) > 11 && instr[:11] == "deposit_to=" {
+		if asset == "eth" {
+			continue
+		}
+		if len(instr) > 11 && instr[:11] == "deposit_to=" {
 			dest = instr[11:]
 		}
 		if len(instr) > 8 && instr[:8] == "swap_to=" {
@@ -1041,6 +1053,12 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 		return ce.NewContractError(ce.ErrInitialization, "no headers", "replaceWithdrawal")
 	}
 
+	// review6 L1/X3 (adversarial-review correction): HandleReplaceWithdrawal
+	// was the 5th gas-fee site the audit's "four sites" missed. Route the
+	// (3x baseFee + tip) calculation through the same overflow-checked
+	// helper used in HandleUnmapETH / HandleUnmapERC20 / HandleUnmapFrom.
+	// Dormant after H2 closed the oracle-fed-header surface, but the
+	// arithmetic should still be bounded for defense-in-depth.
 	gasTipCap := uint64(4_000_000_000) // doubled
 	// review2 HIGH #16: replaceWithdrawal re-prices at 3x base fee. Route the
 	// cap through the checked helper so an extreme base fee can't wrap uint64
@@ -1115,8 +1133,10 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 
 	// Refund + advance. big.Int/wei: IncBalance always succeeds (no overflow),
 	// so the supply restore mirrors the credit unconditionally.
-	// (Supersedes review6 L2/X2 — the SafeAdd64 guard only mattered for the
-	// int64 supply accumulators, which big.Int has since replaced.)
+	// (Supersedes review6 X2/L2 — the hard-fail-on-overflow guard only
+	// mattered for int64 balances/accumulators; with big.Int the refund
+	// cannot fail, so the invariant "state advanced => user was refunded"
+	// holds unconditionally.)
 	IncBalance(ps.From, ps.Asset, ps.Amount)
 	sup := GetSupply(ps.Asset)
 	sup.Active.Add(sup.Active, ps.Amount)
@@ -1194,6 +1214,8 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) e
 	}
 
 	// Refund + advance. big.Int/wei: additions cannot overflow.
+	// (Supersedes review6 X2 — with big.Int the refund cannot fail, so the
+	// hard-fail-on-overflow guard is structurally unnecessary.)
 	IncBalance(ps.From, ps.Asset, ps.Amount)
 	sup := GetSupply(ps.Asset)
 	sup.Active.Add(sup.Active, ps.Amount)
@@ -1237,8 +1259,9 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// (Supersedes review6 L2/X2 — big.Int supply accumulators cannot overflow,
-	// so the SafeAdd64 guard is unnecessary; IncBalance always succeeds.)
+	// (Supersedes review6 X2/L2 — big.Int supply accumulators cannot overflow,
+	// so the hard-fail guard is unnecessary; IncBalance always succeeds and
+	// "state advanced => user was refunded" holds unconditionally.)
 	IncBalance(ps.From, ps.Asset, ps.Amount)
 	sup := GetSupply(ps.Asset)
 	sup.Active.Add(sup.Active, ps.Amount)
