@@ -172,7 +172,18 @@ func VerifyERC20Deposit(
 		return sender, nil, txHash, ErrProofFailed
 	}
 
-	txHash = crypto.Keccak256Hash(receiptBytes)
+	// review6 M4: dedup key was previously keccak(receiptBytes), which is
+	// stable per receipt but not strictly anchored to the (block, txIndex)
+	// position the MPT proof verified against. Mix the proven TxIndex into
+	// the keying material so two L1 txs that ever produced byte-identical
+	// receipts cannot collide on the observed slot. BlockHeight is already
+	// part of the IsObserved key, so this triple uniquely identifies the
+	// receipt-trie leaf.
+	txIndexBytes := []byte{
+		byte(req.TxIndex >> 24), byte(req.TxIndex >> 16),
+		byte(req.TxIndex >> 8), byte(req.TxIndex),
+	}
+	txHash = crypto.Keccak256Hash(append(receiptBytes, txIndexBytes...))
 
 	if IsObserved(req.BlockHeight, txHash, uint16(req.LogIndex)) {
 		return sender, nil, txHash, ErrAlreadyObserved

@@ -14,6 +14,7 @@ import (
 	"evm-mapping-contract/sdk"
 	"math/big"
 	"strconv"
+	"strings"
 )
 
 // IsWhitelistedRelayer — W4 Cluster C CRIT #8 native-ETH frontrun mitigation
@@ -85,7 +86,9 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 			return ce.NewContractError(ce.ErrInput, "deposit amount must be positive")
 		}
 
-		dest := routeDeposit(sender, params.Instructions, "eth", amount)
+		// review6 H9: thread chainId so native-ETH credit derives the DID from
+		// the deposit chain and deposit_to is ignored for eth (see routeDeposit).
+		dest := routeDeposit(sender, params.Instructions, "eth", amount, chainId)
 
 		// Gas reserve tax: bps of ETH deposits, credited in full wei. big.Int
 		// keeps exact precision (Div truncates toward zero) with no overflow.
@@ -132,7 +135,9 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 			return ce.NewContractError(ce.ErrArithmetic, "deposit amount invalid")
 		}
 
-		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amount)
+		// review6 H9: ERC-20 still honors deposit_to (Transfer-log proof binds
+		// the depositor); chainId is threaded for the AddressToDID binding.
+		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amount, chainId)
 		if dest != "" {
 			IncBalance(dest, tokenInfo.Symbol, amount)
 		}
@@ -190,6 +195,8 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	// review2 HIGH #16: checked arithmetic — a negative (wrapped) fee here
 	// inflated the user's balance instead of debiting it. The fee is now a
 	// *big.Int in WEI, so it composes directly with the wei balance.
+	// (Supersedes review6 L1/X3: big.Int fee math cannot overflow, so the
+	// int64 SafeMul path the audit called for is unnecessary on this base.)
 	gasFeeCap, feeWei, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
@@ -255,6 +262,9 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 		s.Fee.Add(s.Fee, new(big.Int).Sub(totalDeduct, amount))
 		SetSupply("eth", s)
 	}
+	// (review6 M11 dropped here: the inline review2 #76 block above already
+	// performs the full Active/User/Fee accounting for the ETH path, so an
+	// additional TrackWithdrawal call would double-debit the supply counters.)
 
 	// W4 Cluster F D-F-3: snapshot CURRENT vault into VaultAtQueue. When
 	// confirmSpend lands, HandleConfirmSpend ecrecovers against this
@@ -327,6 +337,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 
 	gasTipCap := uint64(2_000_000_000)
 	// review2 HIGH #16: checked arithmetic (see safeGasFee); gasCost is *big.Int WEI.
+	// (Supersedes review6 L1/X3 — big.Int gas math cannot overflow.)
 	gasFeeCap, gasCost, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
@@ -344,6 +355,11 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	if !DecBalance(caller, tokenInfo.Symbol, amount) {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient token balance")
 	}
+	// ERC-20 unmap pays L1 gas out of the contract-wide gas-reserve pool
+	// (deductGasReserve below), NOT out of the user's token balance — so the
+	// per-asset supply has no fee component to debit here. (review6 M11's
+	// feeOnVault arg is dropped: main's big.Int TrackWithdrawal takes only the
+	// debited amount.)
 	TrackWithdrawal(tokenInfo.Symbol, amount)
 
 	// big.Int/wei: gas reserve and gas cost are both full wei — deduct directly.
@@ -642,13 +658,31 @@ func HandleApprove(params *AllowanceParams) error {
 
 // Helpers
 
-func routeDeposit(sender [20]byte, instructions []string, asset string, amount *big.Int) string {
-	did := crypto.AddressToDID(sender, 1)
+// routeDeposit returns the L2 destination + (optionally) routes the deposit
+// through the registered DEX for swap_to / asset_out instructions.
+//
+// review6 H9: the `deposit_to=<addr>` instruction is now HONORED ONLY for
+// ERC-20 deposits, where the Transfer-log proof cryptographically binds the
+// depositor — so a relayer-supplied destination is verifiable. For native
+// ETH deposits, the L1 sender (recovered via ecrecover on the proven raw
+// tx) is the ONLY trusted depositor signal; the caller (whitelisted L2
+// relayer) MUST credit the sender's derived DID. Pre-fix, a rogue/
+// compromised relayer could pass any `deposit_to=<attacker>` and redirect
+// the credit, since IsWhitelistedRelayer is a coarse trust gate that does
+// NOT bind to the actual L1 depositor.
+//
+// chainId is now threaded for the AddressToDID-vs-deposit-chain binding
+// (M3 in the audit's open issues): pre-fix this was hardcoded to 1, which
+// gives the wrong DID on non-mainnet L1s.
+func routeDeposit(sender [20]byte, instructions []string, asset string, amount *big.Int, chainId uint64) string {
+	did := crypto.AddressToDID(sender, chainId)
 	dest := did
 	var swapTo, assetOut, destChain string
 
 	for _, instr := range instructions {
-		if len(instr) > 11 && instr[:11] == "deposit_to=" {
+		// review6 H9: ETH path ignores deposit_to. ERC-20 path still honors
+		// it because the Transfer-log proof binds the depositor.
+		if asset != "eth" && len(instr) > 11 && instr[:11] == "deposit_to=" {
 			dest = instr[11:]
 		}
 		if len(instr) > 8 && instr[:8] == "swap_to=" {
@@ -768,7 +802,8 @@ func getGasReserve() *big.Int {
 
 func addGasReserve(amount *big.Int) {
 	// big.Int/wei: the reserve accumulator is full wei and cannot overflow,
-	// so the prior int64 clamp (EVM-C10) is no longer needed.
+	// so the prior int64 clamp (EVM-C10) is no longer needed. This supersedes
+	// review6 M8, whose SafeAdd64 guard only mattered for the int64 accumulator.
 	current := getGasReserve()
 	current.Add(current, amount)
 	sdk.StateSetObject(constants.GasReserveKey, current.String())
@@ -1080,6 +1115,8 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 
 	// Refund + advance. big.Int/wei: IncBalance always succeeds (no overflow),
 	// so the supply restore mirrors the credit unconditionally.
+	// (Supersedes review6 L2/X2 — the SafeAdd64 guard only mattered for the
+	// int64 supply accumulators, which big.Int has since replaced.)
 	IncBalance(ps.From, ps.Asset, ps.Amount)
 	sup := GetSupply(ps.Asset)
 	sup.Active.Add(sup.Active, ps.Amount)
@@ -1200,6 +1237,8 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
+	// (Supersedes review6 L2/X2 — big.Int supply accumulators cannot overflow,
+	// so the SafeAdd64 guard is unnecessary; IncBalance always succeeds.)
 	IncBalance(ps.From, ps.Asset, ps.Amount)
 	sup := GetSupply(ps.Asset)
 	sup.Active.Add(sup.Active, ps.Amount)
@@ -1268,6 +1307,16 @@ func verifyL1ProofOfDrop(proof *L1ProofOfDrop, ps *PendingSpend, chainId uint64)
 	}
 	switch proof.Type {
 	case L1ProofTypeRevertedReceipt:
+		// review6 H10: Type A now requires BOTH (a) a receipt-trie proof
+		// showing status=0 at TxIndex AND (b) a tx-trie proof showing the
+		// raw tx at the same TxIndex with parsed.Nonce == proof.TxNonce
+		// AND parsed.From == ps.VaultAtQueue. Pre-fix, only (a) was checked
+		// and proof.TxNonce was a user-supplied claim unbound to the proven
+		// receipt — an attacker could prove ANY reverted receipt and claim
+		// ANY nonce, double-spending withdrawals on every proof-required
+		// path (clearNonce, cancelMyWithdrawal, pre-window expireWithdrawal).
+		// Now the tx-trie proof cryptographically binds the nonce + sender
+		// to the proven L1 slot, closing the forgery class.
 		receiptBytes, err := hex.DecodeString(proof.ReceiptHex)
 		if err != nil {
 			return errors.New("invalid receipt_hex")
@@ -1298,6 +1347,55 @@ func verifyL1ProofOfDrop(proof *L1ProofOfDrop, ps *PendingSpend, chainId uint64)
 		}
 		if items[0].AsUint64() != 0 {
 			return errors.New("receipt status != 0 — tx not reverted")
+		}
+		// review6 H10: bind the proven receipt to the L1 tx via the
+		// transactions trie at the SAME TxIndex. The raw tx carries the
+		// nonce + sender; verifying it lets us reject forged proofs where
+		// proof.TxNonce is decoupled from the proven L1 slot.
+		txBytes, err := hex.DecodeString(proof.TxAtIndexHex)
+		if err != nil || len(txBytes) == 0 {
+			return errors.New("Type A requires tx_at_index_hex bound to the proven receipt")
+		}
+		txProofBytes, err := hex.DecodeString(proof.TxProofHex)
+		if err != nil || len(txProofBytes) == 0 {
+			return errors.New("Type A requires tx_proof_hex for nonce binding")
+		}
+		provenTx, err := mpt.VerifyProof(header.TransactionsRoot, mpt.RLPEncodeKey(proof.TxIndex), splitProofNodes(txProofBytes))
+		if err != nil {
+			return errors.New("tx proof verification failed")
+		}
+		if !bytesEqual(provenTx, txBytes) {
+			return errors.New("tx does not match proof")
+		}
+		parsed, err := parseTransaction(txBytes)
+		if err != nil {
+			return errors.New("failed to parse proven tx: " + err.Error())
+		}
+		if chainId != 0 && parsed.ChainId != chainId {
+			return errors.New("proof tx chain id mismatch")
+		}
+		if parsed.Nonce != proof.TxNonce {
+			return errors.New("proven tx nonce does not match proof.tx_nonce — bind failed")
+		}
+		// Verify the proven tx originated from the snapshotted vault. Without
+		// this, an attacker could prove a reverted receipt + a tx from any
+		// OTHER address that happened to share TxIndex in some block — the
+		// nonce would match by coincidence and the bind would silently pass.
+		expectedVault := strings.ToLower(ps.VaultAtQueue)
+		if !strings.HasPrefix(expectedVault, "0x") {
+			expectedVault = "0x" + expectedVault
+		}
+		sighash := computeTxSighash(txBytes, parsed)
+		recoveryV := byte(27 + parsed.V)
+		rPadded := padTo32(parsed.R)
+		sPadded := padTo32(parsed.S)
+		sender, err := crypto.EcrecoverCanonical(sighash, recoveryV, rPadded, sPadded)
+		if err != nil {
+			return errors.New("ecrecover on proven tx failed: " + err.Error())
+		}
+		senderHex := "0x" + hex.EncodeToString(sender[:])
+		if !strings.EqualFold(senderHex, expectedVault) {
+			return errors.New("proven tx sender does not match vault-at-queue — wrong-vault proof")
 		}
 		return nil
 	case L1ProofTypeBlockInclusion:

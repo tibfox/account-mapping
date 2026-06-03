@@ -56,6 +56,12 @@ func safeGasFee(gasUnits, baseFeePerGas, multiplier, gasTipCap uint64) (uint64, 
 	return gasFeeCap, fee, nil
 }
 
+// review6 L1/X3 note: the SafeMul64 / SafeMulUint64 / computeGasFeeCap int64
+// helpers this commit introduced are intentionally omitted on this base. Main
+// already rebuilt all fee arithmetic on *big.Int (see safeGasFee above), which
+// cannot overflow, so the int64 overflow guards the audit asked for are
+// structurally unnecessary here.
+
 func balanceKey(address, asset string) string {
 	return constants.BalancePrefix + address + constants.DirPathDelimiter + asset
 }
