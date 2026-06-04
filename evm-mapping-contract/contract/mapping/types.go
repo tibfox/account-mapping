@@ -67,7 +67,7 @@ type ConfirmSpendRequest struct {
 	// match the looked-up PendingSpend BEFORE proof verification.
 	IntentNonce  uint64 `json:"intent_nonce"`  // PendingSpend.Nonce
 	IntentTo     string `json:"intent_to"`     // PendingSpend.To
-	IntentAmount int64  `json:"intent_amount"` // PendingSpend.Amount (int64 per D-E-0 v22)
+	IntentAmount string `json:"intent_amount"` // PendingSpend.Amount as a decimal-wei string (big.Int/wei migration — JSON-number precision is unsafe for >2^53 wei across non-Go bots)
 	IntentAsset  string `json:"intent_asset"`  // PendingSpend.Asset
 }
 

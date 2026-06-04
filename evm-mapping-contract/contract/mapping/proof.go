@@ -7,18 +7,7 @@ import (
 	"evm-mapping-contract/contract/crypto"
 	"evm-mapping-contract/contract/mpt"
 	"evm-mapping-contract/contract/rlp"
-	"math/big"
 )
-
-// WeiPerGwei — W4 Cluster A Step 3b gwei scaling. 1 gwei = 1e9 wei.
-// Native ETH amounts cross the contract boundary in wei (L1 native unit) but
-// are stored internally in gwei to expand int64 capacity from 9.22 ETH to
-// 9.22 billion ETH. Conversion uses big.Int.Div which truncates toward zero
-// — sub-gwei dust is silently dropped (≈ $0.000000003 at $3K ETH per
-// truncation). The same Div semantics MUST be used at every conversion
-// boundary so deposit-side and confirmSpend-side truncation match
-// bit-for-bit (see Step 3b "Truncation invariant" in the manifest).
-var WeiPerGwei = big.NewInt(1_000_000_000)
 
 var (
 	ErrBlockNotFound   = ce.NewContractError(ce.ErrStateAccess, "block header not found")
@@ -39,7 +28,7 @@ var transferEventSigBytes, _ = hex.DecodeString("ddf252ad1be2c89b69c2b068fc378da
 var TransferEventSig = func() [32]byte { var h [32]byte; copy(h[:], transferEventSigBytes); return h }()
 
 // VerifyETHDeposit verifies a native ETH deposit via transaction inclusion proof.
-// Returns the sender address, deposit amount (gwei as big-endian bytes), and the tx hash.
+// Returns the sender address, deposit amount (wei as big-endian bytes), and the tx hash.
 // W4 Cluster B CRIT #6 Site 1: chainId threaded in so the parsed tx's
 // ChainId field is cross-checked BEFORE ecrecover spends cycles. Pre-fix
 // a chain-X tx could be replayed against the chain-Y bridge state.
@@ -128,19 +117,11 @@ func VerifyETHDeposit(
 	// accounting succeed, so a failure later in the pipeline does not
 	// permanently consume the observed slot for this (blockHeight, txHash, idx).
 	//
-	// W4 Cluster A Step 3b INPUT BOUNDARY (wei -> gwei): convert the parsed
-	// L1 wei amount to gwei before returning. HandleMap stores balances in
-	// gwei (int64 max = 9.22e18 gwei = 9.22 billion ETH), so the boundary
-	// conversion is here. big.Int.Div truncates toward zero — sub-gwei dust
-	// (<1 gwei ≈ $0.000000003) silently disappears. The same Div is used
-	// in HandleConfirmSpend so deposit/withdraw truncation match. Caller
-	// (HandleMap) does NOT re-clamp to int64 — overflow simply cannot fit
-	// in big-endian-encoded bytes at the int64 ceiling, and HandleMap's
-	// big.Int.IsInt64 check catches the upper boundary. We do NOT clamp at
-	// this boundary because the gwei int64 ceiling is unreachable in practice.
-	valueWei := new(big.Int).SetBytes(parsedTx.Value)
-	valueGwei := new(big.Int).Div(valueWei, WeiPerGwei)
-	return sender, valueGwei.Bytes(), txHash, nil
+	// big.Int/wei migration: native ETH is accounted in full wei. The parsed
+	// L1 tx value (big-endian wei) is returned verbatim — no gwei truncation
+	// boundary. HandleMap reconstructs it via big.Int.SetBytes and credits the
+	// exact wei amount.
+	return sender, parsedTx.Value, txHash, nil
 }
 
 // VerifyERC20Deposit verifies an ERC-20 deposit via receipt inclusion proof.

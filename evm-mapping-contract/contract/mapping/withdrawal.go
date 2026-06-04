@@ -59,40 +59,36 @@ func HasPendingWithdrawal() bool {
 // by future versions, or via the unsigned tx hex itself. ERC-20 handler
 // path now carries TokenAddress in PendingSpend as well; see field below.
 //
-// W4 Cluster A Step 3b GWEI DENOMINATION (LAUNCH BLOCKER):
-//   - When Asset == "eth", Amount is in GWEI (1 gwei = 1e9 wei). int64 max
-//     in gwei = 9.22e18 gwei = 9.22 BILLION ETH, so HIGH #38 (whale ETH
-//     stuck) is closed. The L1 unsigned tx value is built by multiplying
-//     Amount * 1e9 before BuildETHWithdrawalTx.
+// big.Int/wei DENOMINATION (replaces the W4 Cluster A Step 3b gwei scaling):
+//   - When Asset == "eth", Amount is in full WEI (1 ETH = 1e18 wei). It is a
+//     *big.Int, so there is no int64 ceiling — whale withdrawals fit exactly
+//     (HIGH #38 closed structurally) and NO sub-gwei dust is dropped: the L1
+//     unsigned tx value equals Amount verbatim.
 //   - When Asset != "eth" (any ERC-20 / native token), Amount is in the
 //     token-native unit (USDC = 6 decimals). NO scaling applied.
-//   - Sub-gwei dust truncation at deposit time means a whale depositing
-//     20.000_000_001_234_567_890 ETH credits 20_000_000_001 gwei; the
-//     remainder is dropped (Step 3b acknowledged cost).
-//   - Pre-Step-3b PendingSpend entries on testnet would have Amount in
-//     wei; HandleConfirmSpend's L1 verification would 1e9x-mismatch.
-//     Mitigation: clearTestnetState clears all ps-* keys during the
-//     paused upgrade window. Mainnet is a fresh deploy.
+//   - JSON round-trips via *big.Int's marshaler (a decimal number token);
+//     GetPendingSpend defends against a nil Amount on legacy/garbage reads.
 type PendingSpend struct {
-	Nonce         uint64 `json:"nonce"`
-	Amount        int64  `json:"amount"`
-	From          string `json:"from"`
-	To            string `json:"to"`
-	Asset         string `json:"asset"`
-	UnsignedTxHex string `json:"unsigned_tx_hex"`
-	BlockHeight   uint64 `json:"block_height"`
-	VaultAtQueue  string `json:"vault_at_queue"`
+	Nonce         uint64   `json:"nonce"`
+	Amount        *big.Int `json:"amount"`
+	From          string   `json:"from"`
+	To            string   `json:"to"`
+	Asset         string   `json:"asset"`
+	UnsignedTxHex string   `json:"unsigned_tx_hex"`
+	BlockHeight   uint64   `json:"block_height"`
+	VaultAtQueue  string   `json:"vault_at_queue"`
 	// TokenAddress is kept for ERC-20 confirmSpend validation (the receipt
 	// proof needs to know which token contract the tx targeted). This is
 	// NOT one of the 8 cross-cluster-coordinated fields — it is an
 	// internal contract field and the JSON tag is omitempty so the field
 	// is absent for ETH withdrawals.
 	TokenAddress string `json:"token_address,omitempty"`
-	// GasCost is the gas-reserve amount (gwei, post-Step-3b) deducted when
-	// this withdrawal was submitted. Refunded by HandleConfirmSpend's
-	// failure branch (pentest finding EVM-C4). omitempty so ETH/zero
-	// entries stay compact; JSON marshal/unmarshal carry it automatically.
-	GasCost int64 `json:"gas_cost,omitempty"`
+	// GasCost is the gas-reserve amount (full wei) deducted when this
+	// withdrawal was submitted. Refunded by HandleConfirmSpend's failure
+	// branch (pentest finding EVM-C4). *big.Int + omitempty so ETH paths
+	// (which charge the fee to the user balance, not the reserve) leave it
+	// nil and absent; JSON marshal/unmarshal carry it automatically.
+	GasCost *big.Int `json:"gas_cost,omitempty"`
 }
 
 func StorePendingSpend(ps PendingSpend) {
@@ -123,6 +119,12 @@ func GetPendingSpend(nonce uint64) *PendingSpend {
 		// Returning nil routes the caller to "no pending spend" rather
 		// than silently producing a zero-VaultAtQueue PendingSpend.
 		return nil
+	}
+	// Defensive: a legacy/garbage entry missing the amount field leaves
+	// Amount nil; normalize to zero so downstream big.Int arithmetic
+	// (refunds, Cmp, supply restore) never nil-panics.
+	if ps.Amount == nil {
+		ps.Amount = new(big.Int)
 	}
 	ps.Nonce = nonce
 	return ps

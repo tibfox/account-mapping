@@ -2,41 +2,39 @@ package mapping
 
 import (
 	"math"
-	"strconv"
+	"math/big"
 	"testing"
 
 	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/sdk"
 )
 
-// End-to-end reproduction of pentest finding EVM-C10.
+// Pentest finding EVM-C10 (now structural).
 //
-// Bug: addGasReserve previously did `current + amount` with no
-// overflow check. Economically impractical (~92,000 ETH would need
-// to flow through ETH deposits to overflow int64), but cheap to
-// guard. The fix uses safeAdd64 and clamps to MaxInt64 on overflow.
+// Original bug: addGasReserve did `current + amount` on int64 with no
+// overflow check, so a reserve near MaxInt64 could wrap negative. The
+// original fix clamped to MaxInt64.
 //
-// Pre-fix: addGasReserve(MaxInt64-100) followed by
-// addGasReserve(1000) wraps to a negative value.
-// Post-fix: clamps to MaxInt64.
-
+// big.Int/wei migration: the gas reserve is now a *big.Int (full wei), so
+// the int64 overflow that motivated EVM-C10 is structurally impossible —
+// addGasReserve never wraps and never needs to clamp. This test pins the
+// new invariant: a reserve past the old int64 ceiling accumulates EXACTLY,
+// neither wrapping negative (the original bug) nor clamping (the original fix).
 func TestEVMC10_AddGasReserveDoesNotOverflow(t *testing.T) {
 	sdk.ResetTestStateStore()
 
-	// Seed reserve close to MaxInt64.
-	near := math.MaxInt64 - int64(100)
-	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(near, 10))
+	// Seed the reserve just below the old int64 ceiling.
+	near := new(big.Int).Sub(big.NewInt(math.MaxInt64), big.NewInt(100)) // MaxInt64 - 100
+	sdk.StateSetObject(constants.GasReserveKey, near.String())
 
-	addGasReserve(int64(1000))
+	addGasReserve(big.NewInt(1000))
 
 	got := getGasReserve()
-	if got < 0 {
-		t.Fatalf(
-			"EVM-C10 leak: addGasReserve overflowed to a negative value. "+
-				"got %d (start=%d, added=1000)",
-			got, near)
+	if got.Sign() < 0 {
+		t.Fatalf("EVM-C10 leak: gas reserve went negative — big.Int must never wrap. got %s", got)
 	}
-	if got != math.MaxInt64 {
-		t.Errorf("expected clamp to MaxInt64, got %d", got)
+	want := new(big.Int).Add(near, big.NewInt(1000)) // MaxInt64 + 900 — past the int64 ceiling
+	if got.Cmp(want) != 0 {
+		t.Fatalf("expected exact accumulation to %s (no wrap, no clamp), got %s", want, got)
 	}
 }

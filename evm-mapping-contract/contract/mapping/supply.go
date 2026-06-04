@@ -1,18 +1,27 @@
 package mapping
 
 import (
-	"errors"
 	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/sdk"
+	"math/big"
 	"strconv"
 	"strings"
 )
 
+// Supply tracks per-asset solvency totals. The three monetary accumulators
+// are *big.Int (full wei / token-native precision, no overflow). BaseFee is
+// a per-gas price observation (wei/gas) and stays a uint64 scalar.
 type Supply struct {
-	Active  int64  // total bridged
-	User    int64  // credited to users
-	Fee     int64  // protocol fees
-	BaseFee uint64 // latest base fee
+	Active  *big.Int // total bridged
+	User    *big.Int // credited to users
+	Fee     *big.Int // protocol fees
+	BaseFee uint64   // latest base fee
+}
+
+// newSupply returns a zero Supply with non-nil accumulators so callers can
+// always do s.Active.Add(...) without a nil check.
+func newSupply() Supply {
+	return Supply{Active: new(big.Int), User: new(big.Int), Fee: new(big.Int)}
 }
 
 func supplyKey(asset string) string {
@@ -20,98 +29,58 @@ func supplyKey(asset string) string {
 }
 
 func GetSupply(asset string) Supply {
+	s := newSupply()
 	data := sdk.StateGetObject(supplyKey(asset))
 	if data == nil {
-		return Supply{}
+		return s
 	}
 	fields := strings.Split(*data, "|")
 	if len(fields) < 4 {
-		return Supply{}
+		return s
 	}
-	s := Supply{}
-	s.Active, _ = strconv.ParseInt(fields[0], 10, 64)
-	s.User, _ = strconv.ParseInt(fields[1], 10, 64)
-	s.Fee, _ = strconv.ParseInt(fields[2], 10, 64)
+	s.Active = parseAmount(fields[0])
+	s.User = parseAmount(fields[1])
+	s.Fee = parseAmount(fields[2])
 	s.BaseFee, _ = strconv.ParseUint(fields[3], 10, 64)
 	return s
 }
 
 func SetSupply(asset string, s Supply) {
-	data := strconv.FormatInt(s.Active, 10) + "|" +
-		strconv.FormatInt(s.User, 10) + "|" +
-		strconv.FormatInt(s.Fee, 10) + "|" +
+	data := s.Active.String() + "|" +
+		s.User.String() + "|" +
+		s.Fee.String() + "|" +
 		strconv.FormatUint(s.BaseFee, 10)
 	sdk.StateSetObject(supplyKey(asset), data)
 }
 
-// TrackDeposit accumulates per-asset supply totals. Two unguarded int64
-// additions live here per CRIT #3: the inner (userAmount + feeAmount) sum
-// and the (s.Active += ...) accumulator. Both must safe-add — wrapping the
-// accumulator silently corrupts supply forever.
-func TrackDeposit(asset string, userAmount, feeAmount int64) error {
+// TrackDeposit accumulates per-asset supply totals. big.Int accumulators
+// cannot overflow, so there is no failure mode and nothing to return.
+func TrackDeposit(asset string, userAmount, feeAmount *big.Int) {
 	s := GetSupply(asset)
-	delta, err := SafeAdd64(userAmount, feeAmount)
-	if err != nil {
-		return errors.New("TrackDeposit: userAmount+feeAmount overflow")
-	}
-	newActive, err := SafeAdd64(s.Active, delta)
-	if err != nil {
-		return errors.New("TrackDeposit: active accumulator overflow")
-	}
-	newUser, err := SafeAdd64(s.User, userAmount)
-	if err != nil {
-		return errors.New("TrackDeposit: user accumulator overflow")
-	}
-	newFee, err := SafeAdd64(s.Fee, feeAmount)
-	if err != nil {
-		return errors.New("TrackDeposit: fee accumulator overflow")
-	}
-	s.Active = newActive
-	s.User = newUser
-	s.Fee = newFee
+	delta := new(big.Int).Add(userAmount, feeAmount)
+	s.Active.Add(s.Active, delta)
+	s.User.Add(s.User, userAmount)
+	s.Fee.Add(s.Fee, feeAmount)
 	SetSupply(asset, s)
-	return nil
 }
 
 // TrackWithdrawal subtracts amount from the tracked Active and
 // User supply for an asset.
 //
 // Pentest finding F17: previously this function silently clamped
-// negative results to 0:
-//
-//   if s.Active < 0 { s.Active = 0 }
-//   if s.User   < 0 { s.User   = 0 }
-//
-// Every public withdrawal path validates the user's balance before
-// reaching here, so the clamp could only fire if some other code
-// path violated that invariant. That made it defense-in-depth
-// against latent bugs — but instead of surfacing the bug at the
-// call site, the helper would silently corrupt the supply counters.
-// Abort loudly instead so a programming error in a caller is
-// caught immediately rather than papered over.
-func TrackWithdrawal(asset string, amount int64) {
+// negative results to 0. Every public withdrawal path validates the
+// user's balance before reaching here, so a negative result can only
+// mean some other code path violated that invariant. Abort loudly
+// instead so a programming error in a caller is caught immediately
+// rather than papered over by silently corrupting the supply counters.
+// big.Int/wei: the comparison and subtraction are full-precision.
+func TrackWithdrawal(asset string, amount *big.Int) {
 	s := GetSupply(asset)
-	if amount > s.Active || amount > s.User {
+	if amount.Cmp(s.Active) > 0 || amount.Cmp(s.User) > 0 {
 		sdk.Abort("supply underflow on TrackWithdrawal: amount " +
-			strconv.FormatInt(amount, 10) + " exceeds tracked supply for asset " + asset)
+			amount.String() + " exceeds tracked supply for asset " + asset)
 	}
-	s.Active -= amount
-	s.User -= amount
+	s.Active.Sub(s.Active, amount)
+	s.User.Sub(s.User, amount)
 	SetSupply(asset, s)
-}
-
-// AdminCredit mints `amount` of `asset` to `address` (owner-only mint)
-// and keeps Supply consistent. review2 #42: adminMint previously did
-// IncBalance only, so Supply.User/Active never reflected admin-minted
-// tokens; a later TrackWithdrawal then drove them negative→clamped,
-// silently corrupting solvency accounting. Mirrors TrackDeposit (no fee).
-func AdminCredit(address, asset string, amount int64) error {
-	if err := IncBalance(address, asset, amount); err != nil {
-		return err
-	}
-	s := GetSupply(asset)
-	s.Active += amount
-	s.User += amount
-	SetSupply(asset, s)
-	return nil
 }

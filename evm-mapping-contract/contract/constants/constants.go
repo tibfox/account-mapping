@@ -17,7 +17,7 @@ const (
 	PrimaryPublicKeyKey     = "pubkey"               // TSS primary public key
 	RouterContractIdKey     = "routerid"             // DEX router contract ID
 	PausedKey               = "paused"               // "1" when paused
-	GasReserveKey           = "gr"                   // gas reserve amount (gwei — scaled from wei at deposit input boundary per W4 Cluster A Step 3b)
+	GasReserveKey           = "gr"                   // gas reserve amount (wei — full L1 native precision; big.Int-encoded decimal string)
 	VaultAddressKey         = "vault"                // vault ETH address
 	ChainIdKey              = "chainid"              // EVM chain ID
 	VerifierContractIdKey   = "zkverifier"           // ZK header verifier contract ID
@@ -57,21 +57,20 @@ const ETHTransferGas = uint64(21_000)
 const ERC20TransferGas = uint64(65_000)
 
 // Minimum withdrawal amounts (in token-native units).
-// W4 Cluster A Step 3b gwei scaling: native ETH internal denomination moved
-// from wei (18 decimals) to gwei (9 decimals). MinETHWithdrawal is now in
-// gwei. 0.01 ETH = 10_000_000 gwei. See W4-cluster-A-deposit-pipeline.md
-// "Step 3b" — sub-gwei dust (<1 gwei ≈ $0.000000003) is truncated at the
-// deposit input boundary in mapping/proof.go::VerifyETHDeposit.
-const MinETHWithdrawal = int64(10_000_000) // 0.01 ETH in GWEI (post-Step-3b)
-const MinUSDCWithdrawal = int64(10_000_000)             // 10 USDC in micro-units
+// big.Int/wei migration: native ETH accounting is now full wei (18 decimals),
+// no gwei scaling. These thresholds are bounded config values (well within
+// int64) compared against big.Int amounts via big.NewInt at the call site;
+// the unbounded accounting values (balances/supply/amounts) are *big.Int.
+// 0.01 ETH = 10_000_000_000_000_000 wei.
+const MinETHWithdrawal = int64(10_000_000_000_000_000) // 0.01 ETH in WEI
+const MinUSDCWithdrawal = int64(10_000_000)            // 10 USDC in micro-units
 
 // Gas reserve
 const GasReserveDepositTaxBps = int64(100) // 1% of ETH deposits go to gas reserve
-// W4 Cluster A Step 3b gwei scaling: MinGasReserve moves to gwei.
-// 0.05 ETH = 50_000_000 gwei. The full reserve accumulator (GasReserveKey)
-// is now denominated in gwei. Operators calling `setGasReserve` MUST pass
-// gwei values, not wei — see W0 P5 deploy runbook update.
-const MinGasReserve = int64(50_000_000) // 0.05 ETH in GWEI minimum reserve
+// big.Int/wei migration: the reserve accumulator (GasReserveKey) is denominated
+// in WEI. Operators calling `setGasReserve` MUST pass wei values.
+// 0.05 ETH = 50_000_000_000_000_000 wei.
+const MinGasReserve = int64(50_000_000_000_000_000) // 0.05 ETH in WEI minimum reserve
 
 // W4 Cluster E CRIT #26 + D-E-3 (LOCKED): withdrawal auto-expiry window.
 // EXPIRY_WINDOW = 5000 Hive blocks ≈ 4 hours (Hive 3s blocks). Any L2 caller

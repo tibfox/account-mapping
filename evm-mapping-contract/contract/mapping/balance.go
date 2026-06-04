@@ -4,61 +4,56 @@ import (
 	"evm-mapping-contract/contract/constants"
 	ce "evm-mapping-contract/contract/contracterrors"
 	"evm-mapping-contract/sdk"
-	"math"
-	"strconv"
+	"math/big"
 )
 
-// SafeAdd64 returns a+b, returning an error on int64 overflow/underflow.
-// Exported per CRIT #3 v17 correction B so callers outside `mapping`
-// (e.g. handlers.go, supply.go) route balance arithmetic through one
-// audited helper.
-func SafeAdd64(a, b int64) (int64, error) {
-	if a > 0 && b > math.MaxInt64-a {
-		return 0, ce.NewContractError(ce.ErrArithmetic, "overflow")
+// parseAmount decodes a base-10 decimal string into a big.Int, returning a
+// zero value (never nil) for empty/garbage input. State stores all monetary
+// values as big.Int decimal strings (.String()), so this is the single
+// decode path for balances, allowances, and the gas reserve.
+func parseAmount(s string) *big.Int {
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return new(big.Int)
 	}
-	if a < 0 && b < math.MinInt64-a {
-		return 0, ce.NewContractError(ce.ErrArithmetic, "underflow")
-	}
-	return a + b, nil
+	return v
 }
 
 // safeGasFee computes (gasFeeCap, fee) where
-//   gasFeeCap = baseFeePerGas*multiplier + gasTipCap
-//   fee       = gasUnits * gasFeeCap
-// rejecting every uint64 add/mul overflow and the int64 truncation.
+//
+//	gasFeeCap = baseFeePerGas*multiplier + gasTipCap   (wei per gas, uint64)
+//	fee       = gasUnits * gasFeeCap                    (total wei, *big.Int)
+//
+// rejecting every uint64 overflow in the per-gas cap. The total fee is a
+// *big.Int so it composes with big.Int wei balances and CANNOT overflow —
+// this structurally closes review2 HIGH #16 (the old int64 fee could wrap
+// negative and inflate the user's balance instead of debiting it).
+//
+// gasFeeCap stays uint64 because it is an EIP-1559 per-gas price written
+// directly into the RLP tx via rlp.EncodeUint64; real per-gas prices sit far
+// below the uint64 ceiling, and the overflow checks below reject any input
+// that would wrap it (which would otherwise sign an under-priced tx).
 //
 // multiplier is the base-fee headroom factor: the unmap paths use 2,
 // replaceWithdrawal re-prices at 3. Pass gasUnits=0 when only the checked
 // gasFeeCap is needed and no fee is charged (the fee return is then 0) —
 // replaceWithdrawal does this because the gas reserve was already deducted
 // at the original unmap.
-//
-// review2 HIGH #16: this was `int64(gasUnits * (baseFeePerGas*<mult> +
-// gasTipCap))` with no checks. A large baseFeePerGas made the uint64
-// product exceed MaxInt64, the int64 cast wrapped NEGATIVE, and the
-// negative fee inflated the user's balance instead of debiting it. The
-// uint64 cap arithmetic could also wrap to a tiny value, signing an
-// under-priced (replacement) withdrawal.
-func safeGasFee(gasUnits, baseFeePerGas, multiplier, gasTipCap uint64) (uint64, int64, error) {
+func safeGasFee(gasUnits, baseFeePerGas, multiplier, gasTipCap uint64) (uint64, *big.Int, error) {
 	scaled := baseFeePerGas * multiplier
 	if baseFeePerGas != 0 && multiplier != 0 && scaled/multiplier != baseFeePerGas {
-		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee cap overflow")
+		return 0, nil, ce.NewContractError(ce.ErrArithmetic, "gas fee cap overflow")
 	}
 	gasFeeCap := scaled + gasTipCap
 	if gasFeeCap < scaled {
-		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee cap overflow")
+		return 0, nil, ce.NewContractError(ce.ErrArithmetic, "gas fee cap overflow")
 	}
 	if gasUnits == 0 || gasFeeCap == 0 {
-		return gasFeeCap, 0, nil
+		return gasFeeCap, new(big.Int), nil
 	}
-	product := gasUnits * gasFeeCap
-	if product/gasFeeCap != gasUnits {
-		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee overflow")
-	}
-	if product > math.MaxInt64 {
-		return 0, 0, ce.NewContractError(ce.ErrArithmetic, "gas fee exceeds int64")
-	}
-	return gasFeeCap, int64(product), nil
+	// big.Int product — exact, no overflow possible.
+	fee := new(big.Int).Mul(new(big.Int).SetUint64(gasUnits), new(big.Int).SetUint64(gasFeeCap))
+	return gasFeeCap, fee, nil
 }
 
 func balanceKey(address, asset string) string {
@@ -69,61 +64,54 @@ func allowanceKey(owner, spender, asset string) string {
 	return constants.AllowancePrefix + owner + constants.DirPathDelimiter + spender + constants.DirPathDelimiter + asset
 }
 
-func GetBalance(address, asset string) int64 {
+// GetBalance returns the caller's ledger balance in the asset's native unit
+// (wei for "eth"). Always non-nil; absent/garbage state reads as zero.
+func GetBalance(address, asset string) *big.Int {
 	data := sdk.StateGetObject(balanceKey(address, asset))
 	if data == nil {
-		return 0
+		return new(big.Int)
 	}
-	v, err := strconv.ParseInt(*data, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v
+	return parseAmount(*data)
 }
 
-func SetBalance(address, asset string, amount int64) {
-	sdk.StateSetObject(balanceKey(address, asset), strconv.FormatInt(amount, 10))
+func SetBalance(address, asset string, amount *big.Int) {
+	sdk.StateSetObject(balanceKey(address, asset), amount.String())
 }
 
-func IncBalance(address, asset string, amount int64) error {
+// IncBalance credits `amount` to the address's ledger balance. big.Int cannot
+// overflow, so there is no failure mode and nothing to return.
+func IncBalance(address, asset string, amount *big.Int) {
 	bal := GetBalance(address, asset)
-	newBal, err := SafeAdd64(bal, amount)
-	if err != nil {
-		return err
-	}
-	SetBalance(address, asset, newBal)
-	return nil
+	bal.Add(bal, amount)
+	SetBalance(address, asset, bal)
 }
 
-func DecBalance(address, asset string, amount int64) bool {
+func DecBalance(address, asset string, amount *big.Int) bool {
 	// CRIT #3: reject non-positive amount. Without this guard, a negative
 	// amount drives `bal - amount` upward and SetBalance writes a credit —
 	// free vault drain. Signature is bool (not (bool,error)) to preserve
 	// every existing caller. Negative/zero amounts are programmer errors,
 	// not user-recoverable conditions.
-	if amount <= 0 {
+	if amount.Sign() <= 0 {
 		return false
 	}
 	bal := GetBalance(address, asset)
-	if bal < amount {
+	if bal.Cmp(amount) < 0 {
 		return false
 	}
-	SetBalance(address, asset, bal-amount)
+	bal.Sub(bal, amount)
+	SetBalance(address, asset, bal)
 	return true
 }
 
-func GetAllowance(owner, spender, asset string) int64 {
+func GetAllowance(owner, spender, asset string) *big.Int {
 	data := sdk.StateGetObject(allowanceKey(owner, spender, asset))
 	if data == nil {
-		return 0
+		return new(big.Int)
 	}
-	v, err := strconv.ParseInt(*data, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v
+	return parseAmount(*data)
 }
 
-func SetAllowance(owner, spender, asset string, amount int64) {
-	sdk.StateSetObject(allowanceKey(owner, spender, asset), strconv.FormatInt(amount, 10))
+func SetAllowance(owner, spender, asset string, amount *big.Int) {
+	sdk.StateSetObject(allowanceKey(owner, spender, asset), amount.String())
 }

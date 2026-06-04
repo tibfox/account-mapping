@@ -12,7 +12,6 @@ import (
 	"evm-mapping-contract/contract/mpt"
 	"evm-mapping-contract/contract/rlp"
 	"evm-mapping-contract/sdk"
-	"math"
 	"math/big"
 	"strconv"
 )
@@ -85,32 +84,24 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 		if amount.Sign() <= 0 {
 			return ce.NewContractError(ce.ErrInput, "deposit amount must be positive")
 		}
-		if !amount.IsInt64() || amount.Int64() <= 0 {
-			return ce.NewContractError(ce.ErrArithmetic, "deposit amount exceeds safe int64 range")
-		}
-		amountInt64 := amount.Int64()
 
-		dest := routeDeposit(sender, params.Instructions, "eth", amountInt64)
+		dest := routeDeposit(sender, params.Instructions, "eth", amount)
 
-		// Gas reserve tax: bps of ETH deposits.
-		// Compute as (amount/10000)*bps + (amount%10000)*bps/10000 so we keep
-		// full precision without ever producing an int64 overflow on amount*bps.
-		gasTax := (amountInt64/10000)*constants.GasReserveDepositTaxBps +
-			(amountInt64%10000)*constants.GasReserveDepositTaxBps/10000
-		if gasTax > 0 {
+		// Gas reserve tax: bps of ETH deposits, credited in full wei. big.Int
+		// keeps exact precision (Div truncates toward zero) with no overflow.
+		gasTax := new(big.Int).Div(
+			new(big.Int).Mul(amount, big.NewInt(constants.GasReserveDepositTaxBps)),
+			big.NewInt(10000),
+		)
+		if gasTax.Sign() > 0 {
 			addGasReserve(gasTax)
-			amountInt64 -= gasTax
+			amount.Sub(amount, gasTax)
 		}
 
 		if dest != "" {
-			if err := IncBalance(dest, "eth", amountInt64); err != nil {
-				return ce.WrapContractError(ce.ErrArithmetic, err, "balance overflow")
-			}
+			IncBalance(dest, "eth", amount)
 		}
-		// CRIT #3: TrackDeposit now returns on supply-accumulator overflow.
-		if err := TrackDeposit("eth", amountInt64, gasTax); err != nil {
-			return err
-		}
+		TrackDeposit("eth", amount, gasTax)
 		// CRIT #8 / W4 Cluster A: lock the observed slot only after the
 		// deposit has been fully routed + credited + accounted. If any
 		// earlier step errors, the slot stays open for the next attempt.
@@ -137,21 +128,15 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 		}
 
 		amount := new(big.Int).SetBytes(amountBytes)
-		if amount.Sign() <= 0 || !amount.IsInt64() || amount.Int64() <= 0 {
-			return ce.NewContractError(ce.ErrArithmetic, "deposit amount invalid or exceeds safe range")
+		if amount.Sign() <= 0 {
+			return ce.NewContractError(ce.ErrArithmetic, "deposit amount invalid")
 		}
-		amountInt64 := amount.Int64()
 
-		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amountInt64)
+		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amount)
 		if dest != "" {
-			if err := IncBalance(dest, tokenInfo.Symbol, amountInt64); err != nil {
-				return ce.WrapContractError(ce.ErrArithmetic, err, "balance overflow")
-			}
+			IncBalance(dest, tokenInfo.Symbol, amount)
 		}
-		// CRIT #3: TrackDeposit now returns on supply-accumulator overflow.
-		if err := TrackDeposit(tokenInfo.Symbol, amountInt64, 0); err != nil {
-			return err
-		}
+		TrackDeposit(tokenInfo.Symbol, amount, new(big.Int))
 		// CRIT #8 / W4 Cluster A + CRIT #14 logIndex: lock observed slot
 		// only after routing + credit succeed.
 		MarkObserved(req.BlockHeight, txHash, uint16(req.LogIndex))
@@ -173,11 +158,11 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return "", ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
-	if amount < constants.MinETHWithdrawal {
+	if amount.Cmp(big.NewInt(constants.MinETHWithdrawal)) < 0 {
 		return "", ce.NewContractError(ce.ErrIntent, "below minimum ETH withdrawal")
 	}
 
@@ -197,58 +182,50 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	}
 
 	gasReserve := getGasReserve()
-	if gasReserve < constants.MinGasReserve {
+	if gasReserve.Cmp(big.NewInt(constants.MinGasReserve)) < 0 {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient gas reserve")
 	}
 
 	gasTipCap := uint64(2_000_000_000) // 2 gwei
 	// review2 HIGH #16: checked arithmetic — a negative (wrapped) fee here
-	// inflated the user's balance instead of debiting it.
+	// inflated the user's balance instead of debiting it. The fee is now a
+	// *big.Int in WEI, so it composes directly with the wei balance.
 	gasFeeCap, feeWei, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 	}
 
 	if params.MaxFee != "" {
-		maxFee, err := strconv.ParseInt(params.MaxFee, 10, 64)
-		if err != nil {
+		maxFee, mok := new(big.Int).SetString(params.MaxFee, 10)
+		if !mok {
 			return "", ce.NewContractError(ce.ErrInput, "invalid max_fee")
 		}
 		// HIGH #40: reject negative max_fee instead of silently disabling the cap.
-		if maxFee < 0 {
+		if maxFee.Sign() < 0 {
 			return "", ce.NewContractError(ce.ErrInput, "max_fee must be non-negative")
 		}
-		// HIGH #40: maxFee=0 must mean "no fees accepted" — drop the
-		// previous `maxFee > 0 &&` short-circuit so a zero cap can reject
-		// a positive computed fee. maxFee is quoted in WEI, so compare feeWei.
-		if feeWei > maxFee {
+		// HIGH #40: maxFee=0 must mean "no fees accepted" — a zero cap rejects
+		// any positive computed fee. maxFee and the fee are both WEI.
+		if feeWei.Cmp(maxFee) > 0 {
 			return "", ce.NewContractError(ce.ErrInput, "fee exceeds max_fee")
 		}
 	}
 
-	// W4-A Step 3b: safeGasFee returns the fee in WEI; convert to gwei before
-	// mixing with the gwei-denominated amount/balance. Sub-gwei dust truncates.
-	fee := feeWei / 1_000_000_000
+	// big.Int/wei: the fee is full wei, same denomination as amount/balance.
+	fee := feeWei
 
 	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds.
-	// CRIT #3 / W2 SafeAdd64: replace the unchecked `amount + fee` with a
-	// safe-add so the totalDeduct comparison cannot wrap negative.
-	totalDeduct := amount
+	totalDeduct := new(big.Int).Set(amount)
 	if !params.DeductFee {
-		td, err := SafeAdd64(amount, fee)
-		if err != nil {
-			return "", ce.NewContractError(ce.ErrArithmetic, "amount+fee overflow")
-		}
-		totalDeduct = td
+		totalDeduct.Add(amount, fee)
 	}
-	if GetBalance(caller, "eth") < totalDeduct {
+	if GetBalance(caller, "eth").Cmp(totalDeduct) < 0 {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient balance")
 	}
 
 	nonce := GetPendingNonce()
-	// W4-A Step 3b: amount is gwei; the L1 tx value is wei, so scale up.
-	amountBig := new(big.Int).Mul(big.NewInt(amount), WeiPerGwei)
-	unsigned := BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amountBig)
+	// big.Int/wei: amount is already wei — the L1 tx value equals it verbatim.
+	unsigned := BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amount)
 	sighash := ComputeSighash(unsigned)
 
 	if err := requireTssKey(); err != nil {
@@ -267,15 +244,15 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	// Supply.User == Σ user balances holds.
 	{
 		s := GetSupply("eth")
-		s.Active -= amount
-		if s.Active < 0 {
-			s.Active = 0
+		s.Active.Sub(s.Active, amount)
+		if s.Active.Sign() < 0 {
+			s.Active.SetInt64(0)
 		}
-		s.User -= totalDeduct
-		if s.User < 0 {
-			s.User = 0
+		s.User.Sub(s.User, totalDeduct)
+		if s.User.Sign() < 0 {
+			s.User.SetInt64(0)
 		}
-		s.Fee += totalDeduct - amount
+		s.Fee.Add(s.Fee, new(big.Int).Sub(totalDeduct, amount))
 		SetSupply("eth", s)
 	}
 
@@ -309,8 +286,8 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return "", ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
 	if params.TokenAddress == "" {
@@ -325,7 +302,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	if tokenInfo == nil {
 		return "", ErrInvalidToken
 	}
-	if amount < tokenInfo.MinWithdrawal {
+	if amount.Cmp(big.NewInt(tokenInfo.MinWithdrawal)) < 0 {
 		return "", ce.NewContractError(ce.ErrIntent, "below minimum withdrawal for this token")
 	}
 
@@ -344,20 +321,19 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	}
 
 	gasReserve := getGasReserve()
-	if gasReserve < constants.MinGasReserve {
+	if gasReserve.Cmp(big.NewInt(constants.MinGasReserve)) < 0 {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient gas reserve for ERC-20 withdrawal")
 	}
 
 	gasTipCap := uint64(2_000_000_000)
-	// review2 HIGH #16: checked arithmetic (see safeGasFee).
+	// review2 HIGH #16: checked arithmetic (see safeGasFee); gasCost is *big.Int WEI.
 	gasFeeCap, gasCost, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 	}
 
 	nonce := GetPendingNonce()
-	amountBig := new(big.Int).SetInt64(amount)
-	unsigned := BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, recipientAddr, amountBig)
+	unsigned := BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, recipientAddr, amount)
 	sighash := ComputeSighash(unsigned)
 
 	if err := requireTssKey(); err != nil {
@@ -370,8 +346,8 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	}
 	TrackWithdrawal(tokenInfo.Symbol, amount)
 
-	// W4-A Step 3b: gas reserve is gwei; convert the wei gas cost before deducting.
-	deductGasReserve(gasCost / 1_000_000_000)
+	// big.Int/wei: gas reserve and gas cost are both full wei — deduct directly.
+	deductGasReserve(gasCost)
 
 	// W4 Cluster F D-F-3: snapshot vault for ERC-20 path too.
 	StorePendingSpend(PendingSpend{
@@ -384,7 +360,7 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 		UnsignedTxHex: hex.EncodeToString(unsigned),
 		BlockHeight:   blocklist.GetLastHeight(),
 		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
-		GasCost:       gasCost / 1_000_000_000, // gwei reserve deducted; refunded on failed receipt (EVM-C4)
+		GasCost:       gasCost, // wei reserve deducted; refunded on failed receipt (EVM-C4)
 	})
 	SetPendingNonce(nonce + 1)
 
@@ -419,7 +395,8 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 	if req.IntentTo != ps.To {
 		return errors.New("intent fields do not match pending spend: to")
 	}
-	if req.IntentAmount != ps.Amount {
+	intentAmt, iok := new(big.Int).SetString(req.IntentAmount, 10)
+	if !iok || intentAmt.Cmp(ps.Amount) != 0 {
 		return errors.New("intent fields do not match pending spend: amount")
 	}
 	if req.IntentAsset != ps.Asset {
@@ -499,11 +476,9 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 		if parsedTx.To != psTo {
 			return ce.NewContractError(ce.ErrTransaction, "tx destination does not match pending spend")
 		}
-		// W4-A Step 3b: tx value is wei; ps.Amount is gwei. Convert with the
-		// same Div as VerifyETHDeposit so the truncation invariant holds.
+		// big.Int/wei: both the L1 tx value and ps.Amount are full wei.
 		txAmountWei := new(big.Int).SetBytes(parsedTx.Value)
-		txAmountGwei := new(big.Int).Div(txAmountWei, WeiPerGwei)
-		if !txAmountGwei.IsInt64() || txAmountGwei.Int64() != ps.Amount {
+		if txAmountWei.Cmp(ps.Amount) != 0 {
 			return ce.NewContractError(ce.ErrTransaction, "tx amount does not match pending spend")
 		}
 	} else {
@@ -534,7 +509,7 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 			return ce.NewContractError(ce.ErrTransaction, "erc20 recipient does not match pending spend")
 		}
 		callAmount := new(big.Int).SetBytes(parsedTx.Data[36:68])
-		if !callAmount.IsInt64() || callAmount.Int64() != ps.Amount {
+		if callAmount.Cmp(ps.Amount) != 0 {
 			return ce.NewContractError(ce.ErrTransaction, "erc20 amount does not match pending spend")
 		}
 	}
@@ -573,22 +548,18 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
 	} else {
-		// Best-effort refund. If IncBalance overflows (user already at int64 max),
-		// we still clear pending state — otherwise the contract is permanently
-		// jammed for a near-impossible scenario. Only update supply when the
-		// refund actually landed so balance and supply stay consistent.
-		if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-			s := GetSupply(ps.Asset)
-			s.Active += ps.Amount
-			s.User += ps.Amount
-			SetSupply(ps.Asset, s)
-		}
-		// Pentest finding EVM-C4: previously the gas reserve that
-		// was charged at unmap time was never refunded on a failed
-		// receipt. ~383 failed ERC-20 withdrawals would exhaust
-		// 0.05 ETH and then block ALL withdrawals. Restore the
-		// reserve so the bridge keeps working.
-		if ps.GasCost > 0 {
+		// Refund the failed withdrawal and restore supply. big.Int/wei:
+		// IncBalance cannot overflow, so balance and supply move together.
+		IncBalance(ps.From, ps.Asset, ps.Amount)
+		s := GetSupply(ps.Asset)
+		s.Active.Add(s.Active, ps.Amount)
+		s.User.Add(s.User, ps.Amount)
+		SetSupply(ps.Asset, s)
+		// Pentest finding EVM-C4: the gas reserve charged at unmap time was
+		// never refunded on a failed receipt. ~383 failed ERC-20 withdrawals
+		// would exhaust 0.05 ETH and then block ALL withdrawals. Restore the
+		// reserve (full wei) so the bridge keeps working.
+		if ps.GasCost != nil && ps.GasCost.Sign() > 0 {
 			addGasReserve(ps.GasCost)
 		}
 		DeletePendingSpend(confirmedNonce)
@@ -605,8 +576,8 @@ func HandleTransfer(params *TransferParams) error {
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
 
@@ -619,9 +590,7 @@ func HandleTransfer(params *TransferParams) error {
 	if !DecBalance(caller, params.Asset, amount) {
 		return ce.NewContractError(ce.ErrBalance, "insufficient balance")
 	}
-	if err := IncBalance(params.To, params.Asset, amount); err != nil {
-		return ce.WrapContractError(ce.ErrArithmetic, err, "recipient balance overflow")
-	}
+	IncBalance(params.To, params.Asset, amount)
 	return nil
 }
 
@@ -632,8 +601,8 @@ func HandleTransferFrom(params *TransferParams) error {
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
 
@@ -643,17 +612,15 @@ func HandleTransferFrom(params *TransferParams) error {
 	}
 
 	allowance := GetAllowance(params.From, caller, params.Asset)
-	if allowance < amount {
+	if allowance.Cmp(amount) < 0 {
 		return ce.NewContractError(ce.ErrBalance, "insufficient allowance")
 	}
 
 	if !DecBalance(params.From, params.Asset, amount) {
 		return ce.NewContractError(ce.ErrBalance, "insufficient balance")
 	}
-	SetAllowance(params.From, caller, params.Asset, allowance-amount)
-	if err := IncBalance(params.To, params.Asset, amount); err != nil {
-		return ce.WrapContractError(ce.ErrArithmetic, err, "recipient balance overflow")
-	}
+	SetAllowance(params.From, caller, params.Asset, new(big.Int).Sub(allowance, amount))
+	IncBalance(params.To, params.Asset, amount)
 	return nil
 }
 
@@ -664,8 +631,8 @@ func HandleApprove(params *AllowanceParams) error {
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount < 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() < 0 {
 		return ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
 
@@ -675,7 +642,7 @@ func HandleApprove(params *AllowanceParams) error {
 
 // Helpers
 
-func routeDeposit(sender [20]byte, instructions []string, asset string, amount int64) string {
+func routeDeposit(sender [20]byte, instructions []string, asset string, amount *big.Int) string {
 	did := crypto.AddressToDID(sender, 1)
 	dest := did
 	var swapTo, assetOut, destChain string
@@ -704,23 +671,21 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount i
 		env := sdk.GetEnv()
 		selfAddr := "contract:" + env.ContractId
 
-		if err := IncBalance(selfAddr, asset, amount); err != nil {
-			return dest
-		}
+		IncBalance(selfAddr, asset, amount)
 		SetAllowance(selfAddr, "contract:"+routerId, asset, amount)
 
 		instrJSON, _ := json.Marshal(DexInstruction{
 			Type:             "swap",
 			Version:          "1.0.0",
 			AssetIn:          asset,
-			AmountIn:         strconv.FormatInt(amount, 10),
+			AmountIn:         amount.String(),
 			AssetOut:         assetOut,
 			Recipient:        swapTo,
 			DestinationChain: destChain,
 		})
 
 		result := sdk.ContractCall(routerId, "execute", string(instrJSON), nil)
-		SetAllowance(selfAddr, "contract:"+routerId, asset, 0)
+		SetAllowance(selfAddr, "contract:"+routerId, asset, new(big.Int))
 
 		if result == nil {
 			// Router call failed. Reverse the self-balance credit and fall through
@@ -793,35 +758,29 @@ func requireTssKey() error {
 	return nil
 }
 
-func getGasReserve() int64 {
+func getGasReserve() *big.Int {
 	data := sdk.StateGetObject(constants.GasReserveKey)
 	if data == nil {
-		return 0
+		return new(big.Int)
 	}
-	v, _ := strconv.ParseInt(*data, 10, 64)
-	return v
+	return parseAmount(*data)
 }
 
-func addGasReserve(amount int64) {
+func addGasReserve(amount *big.Int) {
+	// big.Int/wei: the reserve accumulator is full wei and cannot overflow,
+	// so the prior int64 clamp (EVM-C10) is no longer needed.
 	current := getGasReserve()
-	// Pentest finding EVM-C10: bare current+amount could overflow
-	// int64 (~92,000 ETH economically impractical, but cheap to
-	// guard against). On overflow, clamp to MaxInt64 so the
-	// reserve still grows but can't wrap negative.
-	sum, err := SafeAdd64(current, amount)
-	if err != nil {
-		sum = math.MaxInt64
-	}
-	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(sum, 10))
+	current.Add(current, amount)
+	sdk.StateSetObject(constants.GasReserveKey, current.String())
 }
 
-func deductGasReserve(amount int64) {
+func deductGasReserve(amount *big.Int) {
 	current := getGasReserve()
-	newVal := current - amount
-	if newVal < 0 {
-		newVal = 0
+	current.Sub(current, amount)
+	if current.Sign() < 0 {
+		current.SetInt64(0)
 	}
-	sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(newVal, 10))
+	sdk.StateSetObject(constants.GasReserveKey, current.String())
 }
 
 func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint64) error {
@@ -835,11 +794,11 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
-	if params.Asset == "eth" && amount < constants.MinETHWithdrawal {
+	if params.Asset == "eth" && amount.Cmp(big.NewInt(constants.MinETHWithdrawal)) < 0 {
 		return ce.NewContractError(ce.ErrIntent, "below minimum ETH withdrawal")
 	}
 
@@ -889,58 +848,51 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		if tokenInfo == nil {
 			return ErrInvalidToken
 		}
-		if amount < tokenInfo.MinWithdrawal {
+		if amount.Cmp(big.NewInt(tokenInfo.MinWithdrawal)) < 0 {
 			return ce.NewContractError(ce.ErrIntent, "below minimum withdrawal for this token")
 		}
-		if getGasReserve() < constants.MinGasReserve {
+		if getGasReserve().Cmp(big.NewInt(constants.MinGasReserve)) < 0 {
 			return ce.NewContractError(ce.ErrBalance, "insufficient gas reserve for ERC-20 withdrawal")
 		}
 	} else {
 		// W4 Cluster C CRIT #7: ETH path now also enforces the gas reserve
 		// floor + debits (amount + fee) from the owner.
-		if getGasReserve() < constants.MinGasReserve {
+		if getGasReserve().Cmp(big.NewInt(constants.MinGasReserve)) < 0 {
 			return ce.NewContractError(ce.ErrTransaction, "insufficient gas reserve")
 		}
 	}
 
 	allowance := GetAllowance(params.From, caller, params.Asset)
-	if allowance < amount {
+	if allowance.Cmp(amount) < 0 {
 		return ce.NewContractError(ce.ErrBalance, "insufficient allowance")
 	}
 
 	// W4 Cluster C CRIT #7 (ETH path) — compute the gas fee and debit
 	// (amount + fee) instead of just amount. Pre-fix, the ETH path
 	// computed no fee and the vault absorbed the L1 mining cost on every
-	// withdrawal. Route the addition through SafeAdd64 (W2 CRIT #3).
-	totalDeduct := amount
+	// withdrawal. big.Int/wei: amount and fee are both full wei.
+	totalDeduct := new(big.Int).Set(amount)
 	if params.Asset == "eth" {
 		_, feeWei, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
 		if feeErr != nil {
 			return ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 		}
 		if params.MaxFee != "" {
-			maxFee, perr := strconv.ParseInt(params.MaxFee, 10, 64)
-			if perr != nil {
+			maxFee, mok := new(big.Int).SetString(params.MaxFee, 10)
+			if !mok {
 				return ce.NewContractError(ce.ErrInput, "invalid max_fee")
 			}
-			if maxFee < 0 {
+			if maxFee.Sign() < 0 {
 				return ce.NewContractError(ce.ErrInput, "max_fee must be non-negative")
 			}
-			if feeWei > maxFee {
+			if feeWei.Cmp(maxFee) > 0 {
 				return ce.NewContractError(ce.ErrTransaction, "fee exceeds max_fee")
 			}
 		}
-		// Step 3b: gwei conversion before SafeAdd64.
-		fee := feeWei / 1_000_000_000
-		td, addErr := SafeAdd64(amount, fee)
-		if addErr != nil {
-			return ce.NewContractError(ce.ErrArithmetic, "amount+fee overflow")
+		if !params.DeductFee {
+			totalDeduct.Add(amount, feeWei)
 		}
-		totalDeduct = td
-		if params.DeductFee {
-			totalDeduct = amount
-		}
-		if GetBalance(params.From, "eth") < totalDeduct {
+		if GetBalance(params.From, "eth").Cmp(totalDeduct) < 0 {
 			return ce.NewContractError(ce.ErrTransaction, "insufficient balance in owner account")
 		}
 	}
@@ -949,7 +901,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	if !DecBalance(params.From, params.Asset, totalDeduct) {
 		return ce.NewContractError(ce.ErrBalance, "insufficient balance in owner account")
 	}
-	SetAllowance(params.From, caller, params.Asset, allowance-amount)
+	SetAllowance(params.From, caller, params.Asset, new(big.Int).Sub(allowance, amount))
 	TrackWithdrawal(params.Asset, amount)
 
 	nonce := GetPendingNonce()
@@ -957,27 +909,23 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	var unsigned []byte
 	var asset string
 	var tokenAddress string
-	var deductedGas int64
+	var deductedGas *big.Int
 	if params.Asset == "eth" {
-		// W4-A Step 3b: ETH amount is gwei; scale to wei for the L1 tx.
-		amountBig := new(big.Int).Mul(big.NewInt(amount), WeiPerGwei)
-		unsigned = BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amountBig)
+		// big.Int/wei: amount is already wei — the L1 tx value equals it.
+		unsigned = BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amount)
 		asset = "eth"
 	} else {
-		// ERC-20: token-native units (no gwei scaling).
-		amountBig := new(big.Int).SetInt64(amount)
-		unsigned = BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
+		// ERC-20: token-native units.
+		unsigned = BuildERC20WithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amount)
 		asset = params.Asset
 		tokenAddress = params.TokenAddress
-		// review2 HIGH #16: checked gas cost (wei); Step 3b converts to gwei
-		// for the gwei-denominated reserve.
+		// review2 HIGH #16: checked gas cost in full wei for the reserve.
 		_, gasReserveFee, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, 2, gasTipCap)
 		if feeErr != nil {
 			return ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 		}
-		gasCostGwei := gasReserveFee / 1_000_000_000
-		deductGasReserve(gasCostGwei)
-		deductedGas = gasCostGwei // recorded for the EVM-C4 refund on failed receipt
+		deductGasReserve(gasReserveFee)
+		deductedGas = gasReserveFee // wei reserve deducted; refunded on failed receipt (EVM-C4)
 	}
 
 	sighash := ComputeSighash(unsigned)
@@ -994,7 +942,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		UnsignedTxHex: hex.EncodeToString(unsigned),
 		BlockHeight:   blocklist.GetLastHeight(),
 		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
-		GasCost:       deductedGas, // gwei reserve deducted; refunded on failed receipt (EVM-C4)
+		GasCost:       deductedGas, // wei reserve deducted; refunded on failed receipt (EVM-C4)
 	})
 	SetPendingNonce(nonce + 1)
 	return nil
@@ -1007,17 +955,13 @@ func HandleIncreaseAllowance(params *AllowanceParams) error {
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
 
 	current := GetAllowance(caller, params.Spender, params.Asset)
-	newVal, err := SafeAdd64(current, amount)
-	if err != nil {
-		return ce.WrapContractError(ce.ErrArithmetic, err, "allowance overflow")
-	}
-	SetAllowance(caller, params.Spender, params.Asset, newVal)
+	SetAllowance(caller, params.Spender, params.Asset, new(big.Int).Add(current, amount))
 	return nil
 }
 
@@ -1028,15 +972,15 @@ func HandleDecreaseAllowance(params *AllowanceParams) error {
 	env := sdk.GetEnv()
 	caller := env.Caller.String()
 
-	amount, err := strconv.ParseInt(params.Amount, 10, 64)
-	if err != nil || amount <= 0 {
+	amount, ok := new(big.Int).SetString(params.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
 		return ce.NewContractError(ce.ErrInput, "invalid amount")
 	}
 
 	current := GetAllowance(caller, params.Spender, params.Asset)
-	newVal := current - amount
-	if newVal < 0 {
-		newVal = 0
+	newVal := new(big.Int).Sub(current, amount)
+	if newVal.Sign() < 0 {
+		newVal.SetInt64(0)
 	}
 	SetAllowance(caller, params.Spender, params.Asset, newVal)
 	return nil
@@ -1081,16 +1025,14 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 
 	var unsigned []byte
 	if ps.Asset == "eth" {
-		// W4-A Step 3b: ps.Amount is gwei; scale to wei for the L1 tx.
-		amountBig := new(big.Int).Mul(big.NewInt(ps.Amount), WeiPerGwei)
-		unsigned = BuildETHWithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, toAddr, amountBig)
+		// big.Int/wei: ps.Amount is already wei.
+		unsigned = BuildETHWithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, toAddr, ps.Amount)
 	} else {
-		amountBig := new(big.Int).SetInt64(ps.Amount)
 		tokenAddr, terr := crypto.HexToAddress(ps.TokenAddress)
 		if terr != nil {
 			return errors.New("pending spend token address parse failed: " + terr.Error())
 		}
-		unsigned = BuildERC20WithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, amountBig)
+		unsigned = BuildERC20WithdrawalTx(chainId, confirmedNonce, gasTipCap, gasFeeCap, tokenAddr, toAddr, ps.Amount)
 	}
 
 	sighash := ComputeSighash(unsigned)
@@ -1136,14 +1078,13 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// Best-effort refund: if the user's balance is at the int64 ceiling we cannot
-	// credit them, but the contract MUST still advance the nonce or it will jam.
-	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-		sup := GetSupply(ps.Asset)
-		sup.Active += ps.Amount
-		sup.User += ps.Amount
-		SetSupply(ps.Asset, sup)
-	}
+	// Refund + advance. big.Int/wei: IncBalance always succeeds (no overflow),
+	// so the supply restore mirrors the credit unconditionally.
+	IncBalance(ps.From, ps.Asset, ps.Amount)
+	sup := GetSupply(ps.Asset)
+	sup.Active.Add(sup.Active, ps.Amount)
+	sup.User.Add(sup.User, ps.Amount)
+	SetSupply(ps.Asset, sup)
 	// bug #8: NonceAdvance re-reads the PendingSpend and no-ops once it's
 	// deleted, so advance BEFORE DeletePendingSpend (race-safe vs HandleExpireWithdrawal).
 	NonceAdvance(ps, 1)
@@ -1215,17 +1156,12 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) e
 		return errors.New("L1ProofOfDrop verify failed: " + err.Error())
 	}
 
-	// Refund + advance (overflow-safe supply restore — review5 parity).
-	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-		sup := GetSupply(ps.Asset)
-		if newActive, errA := SafeAdd64(sup.Active, ps.Amount); errA == nil {
-			if newUser, errU := SafeAdd64(sup.User, ps.Amount); errU == nil {
-				sup.Active = newActive
-				sup.User = newUser
-				SetSupply(ps.Asset, sup)
-			}
-		}
-	}
+	// Refund + advance. big.Int/wei: additions cannot overflow.
+	IncBalance(ps.From, ps.Asset, ps.Amount)
+	sup := GetSupply(ps.Asset)
+	sup.Active.Add(sup.Active, ps.Amount)
+	sup.User.Add(sup.User, ps.Amount)
+	SetSupply(ps.Asset, sup)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
@@ -1264,12 +1200,11 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	if err := IncBalance(ps.From, ps.Asset, ps.Amount); err == nil {
-		sup := GetSupply(ps.Asset)
-		sup.Active += ps.Amount
-		sup.User += ps.Amount
-		SetSupply(ps.Asset, sup)
-	}
+	IncBalance(ps.From, ps.Asset, ps.Amount)
+	sup := GetSupply(ps.Asset)
+	sup.Active.Add(sup.Active, ps.Amount)
+	sup.User.Add(sup.User, ps.Amount)
+	SetSupply(ps.Asset, sup)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
@@ -1412,6 +1347,6 @@ const ConfirmSpendSchemaJSON = `{"version":1,"type":"ConfirmSpendRequest","field
 	`{"name":"receipt_proof_hex","type":"hex"},` +
 	`{"name":"intent_nonce","type":"uint64"},` +
 	`{"name":"intent_to","type":"string"},` +
-	`{"name":"intent_amount","type":"int64"},` +
+	`{"name":"intent_amount","type":"string"},` +
 	`{"name":"intent_asset","type":"string"}` +
 	`]}`

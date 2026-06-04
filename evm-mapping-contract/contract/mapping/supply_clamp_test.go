@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"math/big"
 	"strings"
 	"testing"
 
@@ -45,7 +46,7 @@ func TestF17_TrackWithdrawalAbortsOnUnderflow(t *testing.T) {
 	var panicValue interface{}
 	func() {
 		defer func() { panicValue = recover() }()
-		TrackWithdrawal("eth", 999)
+		TrackWithdrawal("eth", big.NewInt(999))
 	}()
 
 	if panicValue == nil {
@@ -69,7 +70,7 @@ func TestF17_TrackWithdrawalZeroAmountIsFine(t *testing.T) {
 	var panicValue interface{}
 	func() {
 		defer func() { panicValue = recover() }()
-		TrackWithdrawal("eth", 0)
+		TrackWithdrawal("eth", big.NewInt(0))
 	}()
 	if panicValue != nil {
 		t.Fatalf("zero-amount withdrawal should not abort: %v", panicValue)

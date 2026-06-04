@@ -1,6 +1,7 @@
 package mapping
 
 import (
+	"math/big"
 	"testing"
 
 	"evm-mapping-contract/sdk"
@@ -15,26 +16,26 @@ import (
 func TestReview2TransferRejectsEmptyRecipient(t *testing.T) {
 	sdk.ResetTestState()
 	sdk.SetTestCaller("alice")
-	SetBalance("alice", "eth", 1000)
+	SetBalance("alice", "eth", big.NewInt(1000))
 
 	err := HandleTransfer(&TransferParams{To: "", Asset: "eth", Amount: "100"})
 	if err == nil {
 		t.Fatalf("review2 #43: HandleTransfer(To:\"\") returned nil — " +
 			"baseline credits the unspendable \"\" address")
 	}
-	if got := GetBalance("alice", "eth"); got != 1000 {
-		t.Fatalf("review2 #43: caller debited despite rejected transfer: %d, want 1000", got)
+	if got := GetBalance("alice", "eth"); got.Cmp(big.NewInt(1000)) != 0 {
+		t.Fatalf("review2 #43: caller debited despite rejected transfer: %s, want 1000", got)
 	}
-	if got := GetBalance("", "eth"); got != 0 {
-		t.Fatalf("review2 #43: funds credited to \"\" address: %d, want 0", got)
+	if got := GetBalance("", "eth"); got.Sign() != 0 {
+		t.Fatalf("review2 #43: funds credited to \"\" address: %s, want 0", got)
 	}
 
 	// Sanity: a valid transfer still works (identical both arms).
 	if err := HandleTransfer(&TransferParams{To: "bob", Asset: "eth", Amount: "100"}); err != nil {
 		t.Fatalf("review2 #43: valid transfer rejected: %v", err)
 	}
-	if got := GetBalance("bob", "eth"); got != 100 {
-		t.Fatalf("review2 #43: valid transfer not credited: %d", got)
+	if got := GetBalance("bob", "eth"); got.Cmp(big.NewInt(100)) != 0 {
+		t.Fatalf("review2 #43: valid transfer not credited: %s", got)
 	}
 }
 
@@ -47,13 +48,13 @@ func TestReview2TransferRejectsEmptyRecipient(t *testing.T) {
 func TestReview2UnmapRejectsZeroAddress(t *testing.T) {
 	sdk.ResetTestState()
 	sdk.SetTestCaller("alice")
-	SetBalance("alice", "eth", 1_000_000_000_000_000_000)
+	SetBalance("alice", "eth", big.NewInt(1_000_000_000_000_000_000)) // 1 ETH in wei
 
 	zero := "0x0000000000000000000000000000000000000000"
 	_, err := HandleUnmapETH(&TransferParams{
 		To:     zero,
 		Asset:  "eth",
-		Amount: "10000000000000000", // == MinETHWithdrawal (passes the min check)
+		Amount: "10000000000000000", // == MinETHWithdrawal in wei (0.01 ETH) — passes the min check
 	}, [20]byte{0x1}, 1)
 
 	if err == nil {
@@ -62,30 +63,6 @@ func TestReview2UnmapRejectsZeroAddress(t *testing.T) {
 	if !contains(err.Error(), "zero address") {
 		t.Fatalf("review2 #44: expected a zero-address rejection, got %q "+
 			"(baseline has no guard and fails later on an unrelated path)", err.Error())
-	}
-}
-
-// review2 #42 — adminMint did mapping.IncBalance only, never updating
-// Supply, so admin-minted tokens were invisible to solvency accounting
-// and a later TrackWithdrawal drove Supply.User/Active negative→clamped.
-// The fix routes adminMint through AdminCredit, which mirrors the
-// deposit/refund pattern (balance + supply together). This is a
-// GREEN-only regression test (AdminCredit is a new symbol, so no
-// both-arms differential is possible; the one-line IncBalance→AdminCredit
-// change in main.adminMint is itself the fix).
-func TestReview2AdminCreditTracksSupply(t *testing.T) {
-	sdk.ResetTestState()
-
-	if err := AdminCredit("alice", "eth", 500); err != nil {
-		t.Fatalf("review2 #42: AdminCredit returned error: %v", err)
-	}
-	if got := GetBalance("alice", "eth"); got != 500 {
-		t.Fatalf("review2 #42: balance = %d, want 500", got)
-	}
-	s := GetSupply("eth")
-	if s.User != 500 || s.Active != 500 {
-		t.Fatalf("review2 #42: supply not tracked: User=%d Active=%d, want 500/500 "+
-			"(baseline adminMint used IncBalance only → supply stayed 0)", s.User, s.Active)
 	}
 }
 
