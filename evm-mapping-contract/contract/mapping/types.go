@@ -72,21 +72,24 @@ type ConfirmSpendRequest struct {
 	IntentAsset  string `json:"intent_asset"`  // PendingSpend.Asset
 }
 
-// L1ProofOfDrop — W4 Cluster E CRIT #26 + CRIT #27 (D-E-4 LOCKED). One of
-// TWO proof shapes is accepted; bot supplies whichever it can construct:
+// L1ProofOfDrop — W4 Cluster E CRIT #26 + CRIT #27 (D-E-4 LOCKED).
 //
-//   - Type A "reverted-receipt": receipt-trie MPT proof showing the L1 tx
-//     at the cleared/expired nonce was mined with `status=0` (reverted).
-//     Reuses the receipt-trie infrastructure from HandleConfirmSpend
-//     (CRIT #1).
+// SHIPPED STATE (DS-F2 round4): Type A is the ONLY accepted proof shape.
+// Type B is DISABLED pending team review (LOCKED-D-E-4). See verifyL1ProofOfDrop
+// in handlers.go for the H-SM2 explanation: a higher-nonce tx proves the
+// original nonce was CONSUMED but NOT that it was dropped (vs. succeeded),
+// so Type B admits double-spend and requires a full wire-format redesign.
+// Bot implementations MUST use Type A exclusively.
 //
-//   - Type B "block-inclusion-without-tx": prove that block at FinalizedHeight
-//     is finalized AND does NOT contain a tx at TxIndex matching the
-//     expired nonce. Requires a transactions-trie proof PLUS a finality
-//     attestation (encoded as the ZK-verified block header read via
-//     blocklist.GetHeader; the L1 finality is anchored by the SP1 Helios
-//     Groth16 light client — the ZK architecture note above is the trust
-//     root, NOT an external RPC).
+//  - Type A "reverted-receipt" (ACTIVE): receipt-trie MPT proof showing the
+//    L1 tx at the cleared/expired nonce was mined with `status=0` (reverted).
+//    Reuses the receipt-trie infrastructure from HandleConfirmSpend (CRIT #1).
+//    Vault-sender binding via ecrecover against ps.VaultAtQueue.
+//
+//  - Type B "block_inclusion_without_tx" (DISABLED — LOCKED-D-E-4): wire fields
+//    are still present in this struct for forward-compatibility with a future
+//    sound redefinition, but verifyL1ProofOfDrop returns an error for this type.
+//    Do NOT use in production until team review removes the disable gate.
 //
 // LOCKED wire format (this manifest — closes the W1 deferral flagged in
 // MILO-REVIEW §1 Cluster E CONCERNS):
@@ -94,34 +97,26 @@ type ConfirmSpendRequest struct {
 //	{
 //	  "type":              "reverted_receipt" | "block_inclusion_without_tx",
 //	  "block_height":      uint64,            // finalized L1 height of the proof
-//	  "tx_index":          uint64,            // tx index for type A; expected slot for type B
+//	  "tx_index":          uint64,            // tx index for type A; unused for type B (disabled)
 //	  "tx_nonce":          uint64,            // L1 nonce being proven cleared (== ps.Nonce)
 //	  // Type A only — empty for type B
 //	  "receipt_hex":       "0x...",           // RLP receipt with status=0
 //	  "receipt_proof_hex": "0x...",           // concatenated receipt-trie MPT nodes
-//	  // Type B only — empty for type A
-//	  "tx_at_index_hex":   "0x...",           // RLP of whatever tx IS at tx_index in this block
-//	  "tx_proof_hex":      "0x...",           // tx-trie MPT proof for that tx
-//	  // Optional — Type B can include this when the bot wants to prove the
-//	  // vault's L1 account nonce has ALREADY advanced past tx_nonce as an
-//	  // additional safety hint (verified opportunistically).
+//	  // Type B fields (present for forward-compat; ignored while disabled)
+//	  "tx_at_index_hex":   "0x...",
+//	  "tx_proof_hex":      "0x...",
 //	  "vault_nonce_proof_hex": "0x..."
 //	}
 //
-// Verification path (mirrors HandleConfirmSpend's MPT verify):
-//   - Type A: blocklist.GetHeader(BlockHeight) → header.ReceiptsRoot →
-//     mpt.VerifyProof(rcptRoot, rlp(TxIndex), proofNodes) → receipt.Status == 0
-//     AND receipt's parsed nonce field MUST equal TxNonce. Reject otherwise.
-//   - Type B: blocklist.GetHeader(BlockHeight) → header.TransactionsRoot →
-//     mpt.VerifyProof(txRoot, rlp(TxIndex), proofNodes) → parseTransaction(...)
-//     → parsed.Nonce > TxNonce  (i.e. the slot is occupied by a HIGHER nonce
-//     from the same vault, which proves the original tx at TxNonce was
-//     dropped/replaced and the gap is closed). If TxIndex slot is empty
-//     (proof returns nil), reject — bot must use Type A in that case.
+// Verification path (Type A only — Type B is disabled):
+//  - Type A: blocklist.GetHeader(BlockHeight) → header.ReceiptsRoot →
+//    mpt.VerifyProof(rcptRoot, rlp(TxIndex), proofNodes) → receipt.Status == 0
+//    AND receipt's parsed nonce field MUST equal TxNonce. Reject otherwise.
+//    ecrecover binds the proven tx's sender to ps.VaultAtQueue.
 //
-// Mainnet/testnet posture: both types require a header already anchored
-// via the ZK light client (per the ZK architecture note above). The bot
-// MUST NOT supply a header that has not been ingested by HandleAddBlocks.
+// Mainnet/testnet posture: Type A requires a header already anchored via the
+// ZK light client (per the ZK architecture note above). The bot MUST NOT
+// supply a header that has not been ingested by HandleAddBlocks.
 type L1ProofOfDrop struct {
 	Type               string `json:"type"`                  // "reverted_receipt" or "block_inclusion_without_tx"
 	BlockHeight        uint64 `json:"block_height"`          // finalized L1 height
@@ -157,8 +152,11 @@ type ClearNonceParams struct {
 }
 
 // ExpireWithdrawalParams — W4 Cluster E CRIT #26 (D-E-3). Nonce names the
-// confirmed-head withdrawal to expire; proof is REQUIRED for early-cancel
-// by original withdrawer, OPTIONAL for post-window expiry.
+// confirmed-head withdrawal to expire; proof is MANDATORY on ALL paths
+// (DS-F2 round4 / F3b fix). The window governs only WHO may call (pre-window:
+// original withdrawer only; post-window: anyone), not WHETHER proof is
+// required. Omitting proof risks refunding a withdrawal that actually succeeded
+// on L1 (double-spend); any caller must supply a Type-A L1ProofOfDrop.
 type ExpireWithdrawalParams struct {
 	Nonce uint64        `json:"nonce"`
 	Proof L1ProofOfDrop `json:"proof"`

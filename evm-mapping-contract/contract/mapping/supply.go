@@ -49,6 +49,18 @@ func supplyKey(asset string) string {
 	return constants.SupplyKey + constants.DirPathDelimiter + asset
 }
 
+// GetSupply reads the per-asset supply record.
+//
+// MED-133 (m59 F3), ported to develop's big.Int/wei + abort-loudly model: a
+// MISSING key legitimately yields a zero Supply (no bridged balance yet). But a
+// key that EXISTS yet decodes to fewer than 4 fields is CORRUPT (e.g. a layout
+// migration that changed the encoding). Pre-fix develop silently returned
+// Supply{} for both cases, and the caller wrote those zeros straight back,
+// PERMANENTLY destroying the accounting. Abort on the corrupt case so the whole
+// contract call reverts WITHOUT clobbering the stored record — matching
+// TrackWithdrawal's existing underflow abort. (30710e4 used an error-return
+// refactor of GetSupply; develop keeps the no-error signature and aborts, to
+// avoid rippling a signature change through every supply caller.)
 func GetSupply(asset string) Supply {
 	s := newSupply()
 	data := sdk.StateGetObject(supplyKey(asset))
@@ -57,7 +69,7 @@ func GetSupply(asset string) Supply {
 	}
 	fields := strings.Split(*data, "|")
 	if len(fields) < 4 {
-		return s
+		sdk.Abort("GetSupply: corrupt supply record for asset " + asset + " (fewer than 4 fields) — refusing to overwrite")
 	}
 	s.Active = parseAmount(fields[0])
 	s.User = parseAmount(fields[1])

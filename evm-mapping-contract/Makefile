@@ -9,7 +9,15 @@ TINYJSON		:= tinyjson
 TINYJSON_FLAGS 	:= -snake_case -no_std_marshalers
 CONTRACTS_DIR	:= contract
 
-TINYGO_IMAGE := tinygo/tinygo:0.39.0
+# MED-73 (F1) supply-chain fix: pin the TinyGo build image by immutable content
+# digest, NOT by the mutable `tinygo/tinygo:0.39.0` tag. A Docker Hub tag can be
+# re-pushed by whoever controls the upstream repo (or via a registry
+# compromise), silently swapping the compiler and producing a different
+# (potentially backdoored) contract WASM whose CID no longer matches what was
+# reviewed. Docker enforces the digest after the `@`; the tag is kept for
+# readability only. On any TinyGo upgrade, bump BOTH the tag and the digest
+# together (resolve with: docker buildx imagetools inspect tinygo/tinygo:<tag>).
+TINYGO_IMAGE := tinygo/tinygo:0.39.0@sha256:0e51d243c1b84ec650f2dcd1cce3a09bb09730e1134771aeace2240ade4b32f5
 WORKDIR      := /work
 
 # For each local path in go.work (use/replace directives), add a Docker volume

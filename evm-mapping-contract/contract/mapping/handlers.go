@@ -284,6 +284,7 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	// (gas estimated at the fee upper bound), all charged to the caller.
 	// Active and User both shrink by the full debit; the L1 fee is real
 	// custody outflow, not a Magi fee, so Supply.Fee is untouched.
+	// (MED-133 corrupt-supply abort is enforced inside GetSupply now.)
 	TrackWithdrawal("eth", userDebit)
 
 	// W4 Cluster F D-F-3: snapshot CURRENT vault into VaultAtQueue. When
@@ -363,6 +364,23 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	gasFeeCap, gasCost, feeErr := safeGasFee(constants.ERC20TransferGas, header.BaseFeePerGas, 2, gasTipCap)
 	if feeErr != nil {
 		return "", ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
+	}
+	// MED-83 (M30-Scenario-5), ported to develop's wei model: enforce MaxFee on
+	// the ERC-20 path too. Pre-fix only HandleUnmapETH honored MaxFee, so at a
+	// baseFee spike the contract would deduct an unbounded gas cost from the
+	// reserve regardless of the caller's stated cap. gasCost is already WEI here
+	// (safeGasFee), the same denomination as MaxFee — mirror HandleUnmapETH.
+	if params.MaxFee != "" {
+		maxFee, mok := new(big.Int).SetString(params.MaxFee, 10)
+		if !mok {
+			return "", ce.NewContractError(ce.ErrInput, "invalid max_fee")
+		}
+		if maxFee.Sign() < 0 {
+			return "", ce.NewContractError(ce.ErrInput, "max_fee must be non-negative")
+		}
+		if gasCost.Cmp(maxFee) > 0 {
+			return "", ce.NewContractError(ce.ErrInput, "fee exceeds max_fee")
+		}
 	}
 
 	nonce := GetPendingNonce()
@@ -599,6 +617,8 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 		// only where nothing was spent — the proven-dropped path
 		// (refundDroppedWithdrawal). Reserve liveness is preserved: the
 		// deposit tax keeps funding it, and dropped-tx restores now work.
+		// big.Int/wei: IncBalance and the supply adds cannot overflow, so the
+		// int64 best-effort/drift-marker path from 30710e4 is unnecessary here.
 		IncBalance(ps.From, ps.Asset, ps.Amount)
 		s := GetSupply(ps.Asset)
 		s.Active.Add(s.Active, ps.Amount)
@@ -733,6 +753,16 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount *
 	dest := did
 	var swapTo, assetOut, destChain string
 
+	// MED-66 (T2-7/CF-EVM-4) site 2: bound the instruction list. Routing needs
+	// only a handful of directives; an over-cap list is an attacker paying dust
+	// to force unbounded per-element string-slicing. Over the cap, skip
+	// instruction parsing entirely and credit the depositor's own derived DID.
+	// (Note: native-ETH instructions are now depositor-signed calldata — the
+	// old H9 "ignore all eth instructions" stance was reversed by the
+	// parseCalldataInstructions work; the bound still applies as a DoS guard.)
+	if len(instructions) > constants.MaxDepositInstructions {
+		return dest
+	}
 	for _, instr := range instructions {
 		if len(instr) > 11 && instr[:11] == "deposit_to=" {
 			dest = instr[11:]
@@ -758,7 +788,14 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount *
 		selfAddr := "contract:" + env.ContractId
 
 		IncBalance(selfAddr, asset, amount)
-		SetAllowance(selfAddr, "contract:"+routerId, asset, amount)
+		// MED-34 (M23-F18), ported to big.Int: grant the router allowance
+		// ADDITIVELY rather than overwriting it, so a concurrent swap-routed
+		// deposit's residual is not clobbered by a flat SetAllowance. Only THIS
+		// call's contribution is removed on cleanup below. big.Int cannot
+		// overflow, so no SafeAdd guard is needed.
+		routerSpender := "contract:" + routerId
+		prevAllowance := GetAllowance(selfAddr, routerSpender, asset)
+		SetAllowance(selfAddr, routerSpender, asset, new(big.Int).Add(prevAllowance, amount))
 
 		instrJSON, _ := json.Marshal(DexInstruction{
 			Type:             "swap",
@@ -771,7 +808,14 @@ func routeDeposit(sender [20]byte, instructions []string, asset string, amount *
 		})
 
 		result := sdk.ContractCall(routerId, "execute", string(instrJSON), nil)
-		SetAllowance(selfAddr, "contract:"+routerId, asset, new(big.Int))
+		// MED-34 (M23-F18): restore the allowance to the pre-grant snapshot
+		// (prevAllowance) so exactly THIS call's additive grant is removed and
+		// any concurrent routed deposit's residual survives. Magi WASM dispatch
+		// is synchronous, so on SUCCESS the router already consumed `amount`
+		// (slot == prevAllowance, so this is a no-op restore) and on FAILURE the
+		// slot still reads prevAllowance+amount (this removes the grant; the
+		// self-credit is reversed below).
+		SetAllowance(selfAddr, routerSpender, asset, prevAllowance)
 
 		if result == nil {
 			// Router call failed. Reverse the self-balance credit and fall through
@@ -1108,10 +1152,32 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
 	}
+	rwEnv := sdk.GetEnv()
 	confirmedNonce := GetConfirmedNonce()
 	ps := GetPendingSpend(confirmedNonce)
 	if ps == nil {
 		return ce.NewContractError(ce.ErrIntent, "no pending withdrawal to replace", "replaceWithdrawal")
+	}
+
+	// MED-33 (M23-F16): rate-limit replaceWithdrawal so it cannot spam
+	// unbounded TSS signing requests. Each call invokes sdk.TssSignKey; the
+	// propose/execute timelock only governs the first hop, so once a proposal
+	// is executable nothing stopped re-running it every block to burn TSS
+	// resources. Reject if fewer than ReplaceWithdrawalCooldown blocks have
+	// elapsed since the last replace. The cooldown is recorded only after the
+	// signing succeeds (below), so a reverted attempt does not start the clock.
+	//
+	// round3 C-SM3: the cooldown is keyed PER confirmed-head nonce
+	// ("rwlast-{confirmedNonce}") so it cannot bleed across distinct withdrawal
+	// lifecycles. Each new withdrawal (a higher confirmedNonce) reads a fresh
+	// empty key, so its FIRST fee-bump is never blocked by an unrelated prior
+	// withdrawal's replace clock. No reset bookkeeping is needed.
+	cooldownKey := constants.ReplaceWithdrawalLastKey + strconv.FormatUint(confirmedNonce, 10)
+	if last := sdk.StateGetObject(cooldownKey); last != nil {
+		lastH, _ := strconv.ParseUint(*last, 10, 64)
+		if rwEnv.BlockHeight < lastH+constants.ReplaceWithdrawalCooldown {
+			return errors.New("replaceWithdrawal: cooldown not elapsed since last replace")
+		}
 	}
 
 	// Rebuild with 2x gas
@@ -1158,6 +1224,10 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
+	// MED-33 (M23-F16): record the block of this successful replace so the
+	// cooldown gate above can rate-limit the next one. round3 C-SM3: written
+	// under the per-nonce key so the clock is scoped to THIS withdrawal.
+	sdk.StateSetObject(cooldownKey, strconv.FormatUint(rwEnv.BlockHeight, 10))
 	// Update pending spend with new signed TX
 	ps.UnsignedTxHex = hex.EncodeToString(unsigned)
 	StorePendingSpend(*ps)
@@ -1236,6 +1306,9 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 	sdk.TssSignKey("primary", sighash)
 
 	// Proven-dropped refund: full make-whole (value + prepaid fee / reserve).
+	// big.Int refundDroppedWithdrawal cannot overflow, so it subsumes 30710e4's
+	// int64 X2 hard-fail guards; it also refunds the prepaid fee/reserve, which
+	// the int64 value-only refund did not.
 	refundDroppedWithdrawal(ps)
 	// bug #8: NonceAdvance re-reads the PendingSpend and no-ops once it's
 	// deleted, so advance BEFORE DeletePendingSpend (race-safe vs HandleExpireWithdrawal).
@@ -1309,6 +1382,8 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) e
 	}
 
 	// Proven-dropped refund: full make-whole (value + prepaid fee / reserve).
+	// big.Int refundDroppedWithdrawal cannot overflow (subsumes 30710e4's int64
+	// X2 guards) and also refunds the prepaid fee/reserve.
 	refundDroppedWithdrawal(ps)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
@@ -1328,6 +1403,19 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) e
 func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [20]byte, chainId uint64) error {
 	if isPaused() {
 		return errors.New("contract is paused")
+	}
+	// SM-4 (round4, defense-in-depth): require nonce == confirmed-head, matching
+	// the guard in HandleExpireWithdrawal (~:1316-1318). With the
+	// single-outstanding-withdrawal invariant (HasPendingWithdrawal gates new
+	// unmaps), the confirmed nonce is always the only live PendingSpend, so
+	// this is a no-op in normal flow. It closes the parity gap: without it a
+	// non-head nonce lookup would silently find nil (GetPendingSpend returns nil)
+	// and return "no pending spend" rather than a clear "wrong nonce" error —
+	// leaving future code that relaxes the invariant unprotected. Hard-fail
+	// keeps the semantics explicit and auditable.
+	confirmedNonce := GetConfirmedNonce()
+	if nonce != confirmedNonce {
+		return errors.New("cancelMyWithdrawal: target nonce is not the confirmed-nonce head")
 	}
 	ps := GetPendingSpend(nonce)
 	if ps == nil {
@@ -1349,6 +1437,8 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 	sdk.TssSignKey("primary", sighash)
 
 	// Proven-dropped refund: full make-whole (value + prepaid fee / reserve).
+	// big.Int refundDroppedWithdrawal cannot overflow (subsumes 30710e4's int64
+	// X2 guards) and also refunds the prepaid fee/reserve.
 	refundDroppedWithdrawal(ps)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
@@ -1385,7 +1475,9 @@ func HandleClearTestnetState() error {
 		startH = lastH - uint64(constants.MaxBlockRetention*2)
 	}
 	for h := startH; h <= lastH; h++ {
-		sdk.StateDeleteObject(constants.ObservedBlockPrefix + strconv.FormatUint(h, 10))
+		// M21-22: observed entries are now per-entry keys + a cleanup manifest,
+		// not a single o-{height} blob; ClearObservedBlock deletes all of them.
+		ClearObservedBlock(h)
 	}
 	sdk.Log(
 		"clearTestnetState_executed " + `{"action":"clearTestnetState","block_height":` + strconv.FormatUint(
@@ -1397,8 +1489,12 @@ func HandleClearTestnetState() error {
 }
 
 // verifyL1ProofOfDrop — W4 Cluster E D-E-4 LOCKED. Type A: receipt-trie MPT
-// proof + status==0. Type B: tx-trie MPT proof + parsed.Nonce > TxNonce
-// (vault advanced past cleared nonce). Both: blocklist.GetHeader forces
+// proof + status==0 + tx-trie bind + vault-sender ecrecover (sound). Type B
+// (block_inclusion_without_tx) is DISABLED as of round3 H-SM2: its premise
+// ("vault advanced past TxNonce ⇒ original tx dropped") is unsound (a SUCCEEDED
+// withdrawal also advances the nonce) → double-spend. It runs the H-SM1
+// vault-binding then unconditionally rejects; re-enabling requires a sound
+// redefinition + team review (LOCKED D-E-4). Both: blocklist.GetHeader forces
 // block to be ZK-anchored; proof.TxNonce == ps.Nonce.
 func verifyL1ProofOfDrop(proof *L1ProofOfDrop, ps *PendingSpend, chainId uint64) error {
 	if proof == nil || ps == nil {
@@ -1491,11 +1587,17 @@ func verifyL1ProofOfDrop(proof *L1ProofOfDrop, ps *PendingSpend, chainId uint64)
 		if !strings.HasPrefix(expectedVault, "0x") {
 			expectedVault = "0x" + expectedVault
 		}
+		// DS-F1 (round4): switch to EcrecoverStrict (reject high-S) here and
+		// at the Type-B mirror below. The vault binding does NOT dedup by sig
+		// bytes, so a malleable-S replay could forge a second valid sender
+		// binding from the same sig. Strict is the correct policy on every
+		// withdrawal-proof surface; any genuinely-mined low-S tx passes
+		// unchanged.
 		sighash := computeTxSighash(txBytes, parsed)
 		recoveryV := byte(27 + parsed.V)
 		rPadded := padTo32(parsed.R)
 		sPadded := padTo32(parsed.S)
-		sender, err := crypto.EcrecoverCanonical(sighash, recoveryV, rPadded, sPadded)
+		sender, err := crypto.EcrecoverStrict(sighash, recoveryV, rPadded, sPadded)
 		if err != nil {
 			return errors.New("ecrecover on proven tx failed: " + err.Error())
 		}
@@ -1534,7 +1636,52 @@ func verifyL1ProofOfDrop(proof *L1ProofOfDrop, ps *PendingSpend, chainId uint64)
 		if parsed.Nonce <= proof.TxNonce {
 			return errors.New("proof tx nonce does not exceed cleared nonce — vault has not advanced")
 		}
-		return nil
+		// round3 H-SM1 (HIGH, double-spend): Type B previously returned nil here
+		// with NO vault-sender binding — the sibling gap H10 closed on Type A.
+		// Without this, ANY tx from ANY address sitting at some TxIndex of a
+		// ZK-anchored block with nonce > ps.Nonce would pass, forging a drop.
+		// Mirror the Type-A hardening (above ~1556-1571): ecrecover the proven
+		// tx's sender and require it equals the snapshotted vault-at-queue.
+		// DS-F1 (round4): EcrecoverStrict (mirror Type-A fix above); no sig-byte
+		// dedup here, so high-S acceptance opens a malleable-S vault-bind bypass.
+		expectedVault := strings.ToLower(ps.VaultAtQueue)
+		if !strings.HasPrefix(expectedVault, "0x") {
+			expectedVault = "0x" + expectedVault
+		}
+		sighash := computeTxSighash(txBytes, parsed)
+		recoveryV := byte(27 + parsed.V)
+		rPadded := padTo32(parsed.R)
+		sPadded := padTo32(parsed.S)
+		sender, err := crypto.EcrecoverStrict(sighash, recoveryV, rPadded, sPadded)
+		if err != nil {
+			return errors.New("ecrecover on proven tx failed: " + err.Error())
+		}
+		senderHex := "0x" + hex.EncodeToString(sender[:])
+		if !strings.EqualFold(senderHex, expectedVault) {
+			return errors.New("proven tx sender does not match vault-at-queue — wrong-vault proof")
+		}
+		// round3 H-SM2 (HIGH, double-spend, LOCKED-DESIGN D-E-4): even with the
+		// H-SM1 vault binding above, Type B's PREMISE is unsound. EVM nonces are
+		// strictly sequential, so the vault landing a tx at nonce > ps.Nonce only
+		// proves nonce ps.Nonce was CONSUMED — it does NOT distinguish (a) the
+		// original withdrawal tx mining successfully (recipient PAID on L1) from
+		// (b) a same-nonce replacement. A SUCCEEDED withdrawal therefore satisfies
+		// "a later nonce exists", letting the withdrawer (cancelMyWithdrawal /
+		// post-window expireWithdrawal) collect an L2 refund BEFORE confirmSpend
+		// lands → double-spend.
+		//
+		// A provably-sound conservative fix (prove the tx mined AT nonce ps.Nonce
+		// is NOT the withdrawal payout) is NOT achievable surgically in this proof
+		// shape: under the drop premise there is no tx at nonce ps.Nonce to point
+		// at, and Type B's `parsed` tx is at a HIGHER nonce — a receipt check on it
+		// would prove nothing about whether nonce ps.Nonce paid out. Redefining the
+		// proof to carry the tx-at-nonce-N + a non-payment receipt is a full
+		// semantic + wire-format change to a LOCKED design (D-E-4) that requires
+		// team review. Until then, GATE/DISABLE Type B as the safe default. Type A
+		// (reverted-receipt at nonce N, vault-bound) + the expiry window still
+		// provide drop-recovery. The H-SM1 binding above is retained (runs first,
+		// no dead code) so a future sound redefinition starts already hardened.
+		return errors.New("Type-B (block_inclusion_without_tx) drop-proof is disabled pending team review (H-SM2: a higher-nonce tx does not prove the tx at the cleared nonce was dropped rather than paid out — double-spend). Use Type-A (reverted_receipt) or the expiry window.")
 	default:
 		return errors.New("unknown L1ProofOfDrop type: " + proof.Type)
 	}

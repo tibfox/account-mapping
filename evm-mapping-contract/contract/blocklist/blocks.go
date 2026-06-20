@@ -108,11 +108,6 @@ func DeserializeHeader(data string) (*EthBlockHeader, error) {
 	return h, nil
 }
 
-func StoreHeader(header EthBlockHeader) {
-	key := constants.BlockPrefix + strconv.FormatUint(header.BlockNumber, 10)
-	sdk.StateSetObject(key, header.Serialize())
-}
-
 func GetHeader(blockNumber uint64) *EthBlockHeader {
 	key := constants.BlockPrefix + strconv.FormatUint(blockNumber, 10)
 	data := readState(key)
@@ -124,11 +119,6 @@ func GetHeader(blockNumber uint64) *EthBlockHeader {
 		return nil
 	}
 	return h
-}
-
-func DeleteHeader(blockNumber uint64) {
-	key := constants.BlockPrefix + strconv.FormatUint(blockNumber, 10)
-	sdk.StateDeleteObject(key)
 }
 
 func GetLastHeight() uint64 {
@@ -172,24 +162,31 @@ func readState(key string) *string {
 	return result
 }
 
-func SetLastHeight(height uint64) {
-	sdk.StateSetObject(constants.LastHeightKey, strconv.FormatUint(height, 10))
-}
-
-// review6 H2: AddBlockEntry / AddBlocksParams / HandleAddBlocks /
-// HandleSeedBlock / HandleReplaceBlock have been REMOVED. Headers are now
-// sourced exclusively from the configured ZK header-verifier contract
-// (readState routes through VerifierContractIdKey). Any path that lets the
-// operator (or an oracle account) write headers directly into this
-// contract's state is by definition an unbacked-mint surface: the audit's
-// H2 finding showed that forged StateRoot / ReceiptsRoot / BaseFeePerGas
-// composes into H10, H9, X3, L1 — every "this proof verifies against the
-// stored root" check becomes a tautology under operator/oracle compromise.
-// Removing the writer wasmexports and their handlers eliminates the surface
-// entirely. StoreHeader / SetLastHeight / DeleteHeader are kept as
-// private helpers (unused by this package after the H2 cleanup, but
-// retained for the ZK header verifier contract that imports the same
-// blocklist package).
+// review6 H2 + MED M23-F5 (#31) — single source of truth for header state.
+//
+// AddBlockEntry / AddBlocksParams / HandleAddBlocks / HandleSeedBlock /
+// HandleReplaceBlock have been REMOVED. Headers are now sourced EXCLUSIVELY
+// from the configured ZK header-verifier contract (readState routes through
+// VerifierContractIdKey). Any path that lets the operator (or an oracle
+// account) write headers directly into this contract's state is by definition
+// an unbacked-mint surface: the audit's H2 finding showed that forged
+// StateRoot / ReceiptsRoot / BaseFeePerGas composes into H10, H9, X3, L1 —
+// every "this proof verifies against the stored root" check becomes a
+// tautology under operator/oracle compromise.
+//
+// M23-F5 (#31): the local-state WRITERS StoreHeader / SetLastHeight /
+// DeleteHeader have ALSO been removed. GetHeader / GetLastHeight read via
+// readState (the VERIFIER's b-{height} / h keys); a local StateSetObject /
+// StateDeleteObject on BlockPrefix / LastHeightKey therefore targets a
+// DIFFERENT key namespace than the readers ever consult — silently shadowed
+// once a verifier is configured, exactly the divergent-lastHeight drift class
+// M23-F5 / F-M22-MED-1 (#29) flag. They were dead code (no caller in this
+// module; the ZK header verifier is a SEPARATE Go module that only MIRRORS
+// this layout — it does NOT import this package, so the prior "retained for
+// the verifier" rationale was incorrect). Removing them leaves the verifier
+// as the single source of truth with no shadow writer that can ever diverge.
+// The codec (Serialize / DeserializeHeader) is retained for the documented
+// cross-module layout parity; it writes no state and so cannot drift.
 //
 // If a future operational need for an emergency local-state write arises
 // (e.g. fork recovery without re-deploying), the only acceptable path is
