@@ -19,21 +19,34 @@ func supplyKey(asset string) string {
 	return constants.SupplyKey + constants.DirPathDelimiter + asset
 }
 
-func GetSupply(asset string) Supply {
+// GetSupply reads the per-asset supply record.
+//
+// MED-133 (m59 F3): a MISSING key legitimately yields a zero Supply (no
+// bridged balance yet). But a key that EXISTS yet decodes to fewer than 4
+// fields — or whose fields fail to parse — is CORRUPT (e.g. a layout
+// migration that changed the encoding). Pre-fix this silently returned
+// Supply{} and the caller wrote those zeros straight back, PERMANENTLY
+// destroying the accounting. Distinguish the two: missing => (zero, nil);
+// present-but-malformed => error so the caller aborts WITHOUT clobbering the
+// stored record (the whole contract call reverts, preserving state for
+// diagnosis/migration).
+func GetSupply(asset string) (Supply, error) {
 	data := sdk.StateGetObject(supplyKey(asset))
 	if data == nil {
-		return Supply{}
+		return Supply{}, nil
 	}
 	fields := strings.Split(*data, "|")
 	if len(fields) < 4 {
-		return Supply{}
+		return Supply{}, errors.New("GetSupply: corrupt supply record (fewer than 4 fields) — refusing to overwrite")
 	}
-	s := Supply{}
-	s.Active, _ = strconv.ParseInt(fields[0], 10, 64)
-	s.User, _ = strconv.ParseInt(fields[1], 10, 64)
-	s.Fee, _ = strconv.ParseInt(fields[2], 10, 64)
-	s.BaseFee, _ = strconv.ParseUint(fields[3], 10, 64)
-	return s
+	active, errA := strconv.ParseInt(fields[0], 10, 64)
+	user, errU := strconv.ParseInt(fields[1], 10, 64)
+	fee, errF := strconv.ParseInt(fields[2], 10, 64)
+	baseFee, errB := strconv.ParseUint(fields[3], 10, 64)
+	if errA != nil || errU != nil || errF != nil || errB != nil {
+		return Supply{}, errors.New("GetSupply: corrupt supply record (unparseable field) — refusing to overwrite")
+	}
+	return Supply{Active: active, User: user, Fee: fee, BaseFee: baseFee}, nil
 }
 
 func SetSupply(asset string, s Supply) {
@@ -49,7 +62,10 @@ func SetSupply(asset string, s Supply) {
 // and the (s.Active += ...) accumulator. Both must safe-add — wrapping the
 // accumulator silently corrupts supply forever.
 func TrackDeposit(asset string, userAmount, feeAmount int64) error {
-	s := GetSupply(asset)
+	s, err := GetSupply(asset)
+	if err != nil {
+		return err
+	}
 	delta, err := SafeAdd64(userAmount, feeAmount)
 	if err != nil {
 		return errors.New("TrackDeposit: userAmount+feeAmount overflow")
@@ -88,17 +104,45 @@ func TrackDeposit(asset string, userAmount, feeAmount int64) error {
 // feeOnVault  — gwei units the contract pays the L1 miner ON BEHALF OF the
 //               user. Pass 0 for ERC-20 (gas reserve covers fee separately)
 //               or DeductFee=true ETH (fee is netted from amount upstream).
-func TrackWithdrawal(asset string, userAmount, feeOnVault int64) {
-	s := GetSupply(asset)
-	// s.Active reflects total bridged (user + fee component). Deduct both.
-	totalActive := userAmount + feeOnVault
-	s.Active -= totalActive
-	if s.Active < 0 {
-		s.Active = 0
+//
+// MED-133 (m59 F3): now returns an error so a corrupt supply read aborts the
+// withdrawal handler (reverting the already-applied balance debit) instead of
+// silently zeroing the supply record.
+func TrackWithdrawal(asset string, userAmount, feeOnVault int64) error {
+	s, err := GetSupply(asset)
+	if err != nil {
+		return err
 	}
-	s.User -= userAmount
-	if s.User < 0 {
-		s.User = 0
+	// R2-2: route the (userAmount + feeOnVault) sum through SafeAdd64 (mirror
+	// TrackDeposit). Pre-fix this was an unguarded int64 add: a wrap would make
+	// totalActive negative, and `s.Active -= negative` would INFLATE the
+	// bridged-supply oracle — and the floor-at-0 below only ever caught the
+	// underflow direction, so the inflation slipped through silently. A wrap is
+	// a hard reject now, not a silent floor.
+	totalActive, err := SafeAdd64(userAmount, feeOnVault)
+	if err != nil {
+		return errors.New("TrackWithdrawal: userAmount+feeOnVault overflow")
 	}
+	// R2-2: checked subtraction so an internal wrap is a hard reject. The
+	// floor-at-0 is retained ONLY for the legitimate drift case (a debit
+	// slightly exceeding the recorded active total) — never to mask a wrap,
+	// which SafeSub64 now rejects before the floor can hide it.
+	newActive, err := SafeSub64(s.Active, totalActive)
+	if err != nil {
+		return errors.New("TrackWithdrawal: active accumulator underflow")
+	}
+	if newActive < 0 {
+		newActive = 0
+	}
+	newUser, err := SafeSub64(s.User, userAmount)
+	if err != nil {
+		return errors.New("TrackWithdrawal: user accumulator underflow")
+	}
+	if newUser < 0 {
+		newUser = 0
+	}
+	s.Active = newActive
+	s.User = newUser
 	SetSupply(asset, s)
+	return nil
 }

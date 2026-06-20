@@ -12,6 +12,7 @@ import (
 	"evm-mapping-contract/contract/mapping"
 	"evm-mapping-contract/sdk"
 	"strconv"
+	"strings"
 )
 
 var NetworkMode string
@@ -389,6 +390,23 @@ func dispatchAdmin(action string, payload []byte) {
 		if err := json.Unmarshal(payload, &p); err != nil {
 			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setVerifierContract: bad payload"))
 		}
+		// MED-23 (M18-D22): reject an empty contract id. A blank verifier id
+		// makes blocklist.readState short-circuit to nil for EVERY header read
+		// (blocks.go:155-158) — silently nuking the ZK trust root and wedging
+		// all bridge ops with "no block headers available". Fail loud instead.
+		if p.ContractId == "" {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setVerifierContract: empty contract_id"))
+		}
+		// MED-134 (m59 F7): swapping the verifier instantly re-points every
+		// header read at a new contract whose block heights need not match the
+		// old one. Any in-flight withdrawal (its confirmSpend proof binds to a
+		// height anchored under the OLD verifier) would become unconfirmable.
+		// Refuse the swap while a withdrawal is pending so the operator must
+		// first drain/expire the queue (HasPendingWithdrawal is the same
+		// single-outstanding invariant the unmap handlers gate on).
+		if mapping.HasPendingWithdrawal() {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setVerifierContract: withdrawal pending — drain/expire before swapping verifier"))
+		}
 		sdk.StateSetObject(constants.VerifierContractIdKey, p.ContractId)
 
 	case "createKey":
@@ -404,6 +422,12 @@ func dispatchAdmin(action string, payload []byte) {
 	// Operator-tactical (28.8K blocks, 24h)
 	case "registerPublicKey":
 		assertNotPaused()
+		// MED-23 (M18-D22): reject an empty public key. An empty pubkey silently
+		// degrades any consumer that reads PrimaryPublicKeyKey; fail loud rather
+		// than store a blank trust input.
+		if len(payload) == 0 {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "registerPublicKey: empty public key"))
+		}
 		sdk.StateSetObject(constants.PrimaryPublicKeyKey, string(payload))
 
 	case "replaceWithdrawal":
@@ -433,15 +457,53 @@ func dispatchAdmin(action string, payload []byte) {
 		if herr != nil {
 			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "registerToken: invalid address"))
 		}
+		// MED-21 (M18-D20): the registry record is pipe-delimited
+		// (`symbol|decimals|minWithdrawal`). A symbol containing '|' splits the
+		// stored record and corrupts the positional parse in getTokenInfo. Also
+		// reject empty / over-long symbols so the stored record stays bounded
+		// and well-formed.
+		if p.Symbol == "" || len(p.Symbol) > constants.MaxTokenSymbolLen {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "registerToken: symbol empty or too long"))
+		}
+		if strings.Contains(p.Symbol, "|") {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "registerToken: symbol must not contain '|'"))
+		}
+		// MED-20 (M18-D9): bound MinWithdrawal. A negative value is nonsensical;
+		// MaxInt64 (or anything above MaxTokenMinWithdrawal) makes every unmap
+		// of this token revert at the min-withdrawal gate — an admin-induced
+		// per-token DoS.
+		if p.MinWithdrawal < 0 || p.MinWithdrawal > constants.MaxTokenMinWithdrawal {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "registerToken: min_withdrawal out of range"))
+		}
 		mapping.RegisterToken(chainId(), addr, p.Symbol, p.Decimals, p.MinWithdrawal)
 
 	case "registerRouter":
 		assertNotPaused()
+		// MED-23 (M18-D22): reject an empty router id. routeDeposit treats an
+		// empty/absent router id as "no router" and silently skips swap routing
+		// (handlers.go:727); writing "" here would silently disable all swaps
+		// rather than fail loud.
+		if len(payload) == 0 {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "registerRouter: empty router id"))
+		}
 		sdk.StateSetObject(constants.RouterContractIdKey, string(payload))
 
 	case "setGasReserve":
 		assertNotPaused()
-		sdk.StateSetObject(constants.GasReserveKey, string(payload))
+		// MED-22 (M18-D21): setGasReserve previously stored the raw payload
+		// string. getGasReserve (handlers.go) parses it with the error
+		// discarded, so a non-numeric or negative value silently became a 0
+		// reserve — or, with a huge value, a phantom reserve that passes the
+		// MinGasReserve floor while the vault holds nothing. Parse + bound the
+		// value here so only a well-formed, in-range gwei integer is stored.
+		gr, grErr := strconv.ParseInt(string(payload), 10, 64)
+		if grErr != nil {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setGasReserve: value must be a base-10 int64"))
+		}
+		if gr < 0 || gr > constants.MaxGasReserve {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setGasReserve: value out of range"))
+		}
+		sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(gr, 10))
 
 	// review6 H2: `seedBlocks` and `setOracleAccount` cases removed. Header
 	// state is owned by the ZK verifier contract; account-mapping no longer

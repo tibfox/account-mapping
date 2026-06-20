@@ -22,6 +22,21 @@ func SafeAdd64(a, b int64) (int64, error) {
 	return a + b, nil
 }
 
+// SafeSub64 returns a-b, returning an error on int64 overflow/underflow.
+// R2-2: TrackWithdrawal's supply debit must reject an internal wrap as a hard
+// error rather than silently flooring at 0 (a floor on a wrapped value is
+// indistinguishable from — and masks — supply inflation). Same exported-helper
+// rationale as SafeAdd64.
+func SafeSub64(a, b int64) (int64, error) {
+	if b < 0 && a > math.MaxInt64+b {
+		return 0, errors.New("overflow")
+	}
+	if b > 0 && a < math.MinInt64+b {
+		return 0, errors.New("underflow")
+	}
+	return a - b, nil
+}
+
 // SafeMul64 returns a*b, returning an error on int64 overflow/underflow.
 // review6 L1/X3: gas-fee multiplications (`ETHTransferGas * gasFeeCap`,
 // `ERC20TransferGas * gasFeeCap`) bypass the `maxFee` cap when forged

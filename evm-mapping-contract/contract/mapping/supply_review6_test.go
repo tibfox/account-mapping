@@ -22,14 +22,22 @@ func TestReview6_M11_TrackWithdrawalAccounting(t *testing.T) {
 		if err := TrackDeposit(asset, 1000, 10); err != nil {
 			t.Fatalf("TrackDeposit: %v", err)
 		}
-		s := GetSupply(asset)
+		s, err := GetSupply(asset)
+		if err != nil {
+			t.Fatalf("GetSupply: %v", err)
+		}
 		if s.Active != 1010 || s.User != 1000 || s.Fee != 10 {
 			t.Fatalf("after deposit: Active=%d User=%d Fee=%d, want 1010/1000/10",
 				s.Active, s.User, s.Fee)
 		}
 
-		TrackWithdrawal(asset, 1000, 10)
-		s = GetSupply(asset)
+		if err := TrackWithdrawal(asset, 1000, 10); err != nil {
+			t.Fatalf("TrackWithdrawal: %v", err)
+		}
+		s, err = GetSupply(asset)
+		if err != nil {
+			t.Fatalf("GetSupply: %v", err)
+		}
 		if s.Active != 0 {
 			t.Fatalf("Active=%d after withdrawal, want 0 (no drift)", s.Active)
 		}
@@ -53,8 +61,13 @@ func TestReview6_M11_TrackWithdrawalAccounting(t *testing.T) {
 		if err := TrackDeposit(asset, 1000, 10); err != nil {
 			t.Fatalf("TrackDeposit: %v", err)
 		}
-		TrackWithdrawal(asset, 1000, 0)
-		s := GetSupply(asset)
+		if err := TrackWithdrawal(asset, 1000, 0); err != nil {
+			t.Fatalf("TrackWithdrawal: %v", err)
+		}
+		s, err := GetSupply(asset)
+		if err != nil {
+			t.Fatalf("GetSupply: %v", err)
+		}
 		if s.Active != 10 {
 			t.Fatalf("Active=%d after deduct-fee withdrawal, want 10", s.Active)
 		}
@@ -71,8 +84,13 @@ func TestReview6_M11_TrackWithdrawalAccounting(t *testing.T) {
 		const asset = "eth"
 
 		SetSupply(asset, Supply{Active: 30, User: 50, Fee: 0, BaseFee: 0})
-		TrackWithdrawal(asset, 100, 0) // user-debit exceeds s.User (50)
-		s := GetSupply(asset)
+		if err := TrackWithdrawal(asset, 100, 0); err != nil { // user-debit exceeds s.User (50)
+			t.Fatalf("TrackWithdrawal: %v", err)
+		}
+		s, err := GetSupply(asset)
+		if err != nil {
+			t.Fatalf("GetSupply: %v", err)
+		}
 		if s.User != 0 {
 			t.Fatalf("User=%d, want 0 (clamped)", s.User)
 		}

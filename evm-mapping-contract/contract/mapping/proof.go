@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"evm-mapping-contract/contract/blocklist"
+	"evm-mapping-contract/contract/constants"
 	"evm-mapping-contract/contract/crypto"
 	"evm-mapping-contract/contract/mpt"
 	"evm-mapping-contract/contract/rlp"
@@ -316,12 +317,28 @@ func parseEIP1559Tx(data []byte) (*ParsedTx, error) {
 		return nil, errors.New("invalid EIP-1559 tx: too few fields")
 	}
 
+	// MED-27 (M21-15): decode the security-critical integer fields through the
+	// checked path so a forged >8-byte chainId/nonce/v is rejected rather than
+	// silently truncated to its low 8 bytes (which could be made to alias the
+	// contract chainId and slip past the downstream ChainId == chainId check).
+	chainId, err := items[0].AsUint64Checked()
+	if err != nil {
+		return nil, errors.New("invalid EIP-1559 tx: chainId field oversized/non-canonical")
+	}
+	nonce, err := items[1].AsUint64Checked()
+	if err != nil {
+		return nil, errors.New("invalid EIP-1559 tx: nonce field oversized/non-canonical")
+	}
+	vVal, err := items[9].AsUint64Checked()
+	if err != nil {
+		return nil, errors.New("invalid EIP-1559 tx: v field oversized/non-canonical")
+	}
 	tx := &ParsedTx{
-		ChainId: items[0].AsUint64(),
-		Nonce:   items[1].AsUint64(),
+		ChainId: chainId,
+		Nonce:   nonce,
 		Value:   items[6].AsBytes(),
 		Data:    items[7].AsBytes(),
-		V:       byte(items[9].AsUint64()),
+		V:       byte(vVal),
 		R:       items[10].AsBytes(),
 		S:       items[11].AsBytes(),
 	}
@@ -342,9 +359,20 @@ func parseLegacyTx(data []byte) (*ParsedTx, error) {
 		return nil, errors.New("invalid legacy tx: too few fields")
 	}
 
-	v := items[6].AsUint64()
+	// MED-27 (M21-15): legacy v carries chainId via EIP-155 (v = chainId*2 +
+	// 35 + recovery). A >8-byte v would silently truncate and yield a wrong
+	// derived chainId that the downstream equality check could miss. Reject
+	// oversized/non-canonical v and nonce instead of wrapping.
+	v, err := items[6].AsUint64Checked()
+	if err != nil {
+		return nil, errors.New("invalid legacy tx: v field oversized/non-canonical")
+	}
+	nonce, err := items[0].AsUint64Checked()
+	if err != nil {
+		return nil, errors.New("invalid legacy tx: nonce field oversized/non-canonical")
+	}
 	parsed := &ParsedTx{
-		Nonce: items[0].AsUint64(),
+		Nonce: nonce,
 		Value: items[4].AsBytes(),
 		Data:  items[5].AsBytes(),
 		R:     items[7].AsBytes(),
@@ -482,15 +510,53 @@ func parseReceiptLogs(receiptRLP []byte) ([]ParsedLog, error) {
 
 func splitProofNodes(data []byte) [][]byte {
 	// Proof nodes are concatenated RLP items. Decode each one sequentially.
+	//
+	// MED-19 (M18-D7/D8) + MED-66 (T2-7/CF-EVM-4) site 1: enforce the
+	// previously-dead constants.MaxMPTProofNodes HERE — the earliest point a
+	// caller-supplied proof blob is split — so an attacker cannot force an
+	// unbounded node COUNT. The COUNT cap (20) is the real DoS bound:
+	// mpt.VerifyProof re-checks it (MaxProofNodes=20) at verify.go:132.
+	//
+	// R2-1 (fix-round-2) + round3 C-RV (comment correction): the previous
+	// constants.MaxMPTNodeSize=4096 per-node SIZE cap is REMOVED (and the now-
+	// dead constant deleted). It wrongly rejected legitimate ERC-20 RECEIPT-trie
+	// LEAF nodes: a receipt carrying ~20+ Transfer/other logs RLP-encodes well
+	// past 4096 bytes, so VerifyERC20Deposit (and the confirmSpend receipt
+	// proof) would reject the proof and the deposit would become permanently
+	// unprovable — funds stuck on L1.
+	//
+	// The REAL ingress bound on the whole proof blob is MAX_TX_SIZE = 16384
+	// bytes, enforced by the transaction-pool in go-vsc-node (a contract call
+	// carrying this proof is itself an L2 tx and is rejected before execution if
+	// it exceeds MAX_TX_SIZE). The earlier comment's "20 * 64 KB / maxItemSize=
+	// 65536" framing was WRONG: the RLP codec's per-item maxItemSize=65536 is an
+	// internal codec ceiling, not the DoS bound — no proof blob admitted to the
+	// contract can approach 20*64 KB because the entire enclosing tx is capped at
+	// 16 KB upstream. The COUNT cap (20) stays as the in-contract bound that
+	// limits per-call verify work; MAX_TX_SIZE bounds the total bytes.
 	nodes := make([][]byte, 0)
 	offset := 0
 	for offset < len(data) {
+		if len(nodes) >= constants.MaxMPTProofNodes {
+			break
+		}
 		_, end, err := rlp.Decode(data[offset:])
 		if err != nil {
 			break
 		}
 		nodes = append(nodes, data[offset:offset+end])
 		offset += end
+	}
+	// round3 P2C-3: reject the proof blob if it was not fully consumed. Leftover
+	// bytes mean either a decode error mid-stream, trailing garbage, or MORE than
+	// MaxMPTProofNodes concatenated items — all malformed. Previously the loop
+	// silently returned the parsed prefix (which mpt.VerifyProof would usually
+	// reject anyway, but only by coincidence of root-mismatch). Failing here
+	// makes the rejection explicit and deterministic; a well-formed proof always
+	// consumes exactly len(data) within the node-count cap. A legitimate caller
+	// never sends trailing bytes (the wire blob is a pure node concatenation).
+	if offset != len(data) {
+		return nil
 	}
 	return nodes
 }

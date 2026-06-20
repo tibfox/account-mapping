@@ -6,7 +6,22 @@ const DirPathDelimiter = "-"
 const (
 	BalancePrefix           = "a" + DirPathDelimiter // a-{address}-{asset} → balance
 	AllowancePrefix         = "q" + DirPathDelimiter // q-{owner}-{spender}-{asset} → allowance
-	ObservedBlockPrefix     = "o" + DirPathDelimiter // o-{height} → observed deposits
+	ObservedBlockPrefix     = "o" + DirPathDelimiter // o-{height}-... → observed deposits
+	// M21-22: per-entry observed keys make IsObserved/MarkObserved O(1) instead
+	// of the previous O(N) blob read-append-rewrite (which was O(N^2) per block
+	// across all deposits in a block, and an unbounded-blob scan reachable by
+	// already-observed-replay spam). Three key families share the "o-" prefix:
+	//   presence (dedup):   o-{height}-{hex(34-byte entry)} → "1"   (O(1) get/set)
+	//   manifest slot:      o-{height}#{seq}                → entry bytes (cleanup)
+	//   manifest length:    oc-{height}                     → decimal count
+	// "#" cannot appear in a decimal height or in lowercase hex, so the presence
+	// and manifest-slot keys never collide. The manifest exists only so the
+	// testnet-only clearTestnetState cleanup can enumerate+delete per-entry keys
+	// (the SDK exposes no prefix-delete / key-iteration primitive). MarkObserved
+	// appends to the manifest by index (write at slot #count, bump count) without
+	// reading prior entries, so MarkObserved is O(1), not O(N).
+	ObservedCountPrefix     = "oc" + DirPathDelimiter // oc-{height} → entry count
+	ObservedSeqDelimiter    = "#"                     // o-{height}#{seq} → manifest slot
 	BlockPrefix             = "b" + DirPathDelimiter // b-{height} → block header data
 	TxSpendsPrefix          = "d" + DirPathDelimiter // d-{nonce} → pending withdrawal
 	SupplyKey               = "s"                    // supply tracking
@@ -21,6 +36,27 @@ const (
 	VaultAddressKey         = "vault"                // vault ETH address
 	ChainIdKey              = "chainid"              // EVM chain ID
 	VerifierContractIdKey   = "zkverifier"           // ZK header verifier contract ID
+	// MED-33 (M23-F16): block height of the most recent replaceWithdrawal.
+	// HandleReplaceWithdrawal gates on this so an admin (or a compromised
+	// owner key) cannot spam unbounded TSS signing requests by re-issuing
+	// replaceWithdrawal every block — see ReplaceWithdrawalCooldown below.
+	//
+	// round3 C-SM3 (MED-33 follow-up): this is now a PREFIX, keyed per
+	// confirmed-head nonce ("rwlast-{confirmedNonce}"), NOT a single global
+	// key. The prior global key was set but never reset, so its wall-clock
+	// cooldown bled across distinct withdrawal lifecycles — a freshly-stuck
+	// withdrawal could be denied its FIRST fee-bump because an UNRELATED prior
+	// withdrawal replaced recently. Per-nonce keying gives each withdrawal its
+	// own cooldown clock; no reset bookkeeping is needed because the next
+	// withdrawal reads a fresh (empty) key.
+	//
+	// INFO (round4): the OLD global key literal ("rwlast") written by any
+	// pre-round3 deployment is now orphaned — it will never be read or deleted
+	// by any handler. On testnet this is harmless (clearTestnetState does not
+	// enumerate unknown singleton keys). On a fresh mainnet deploy the old key
+	// never exists. No migration action needed; documented here for operator
+	// awareness during any future state migration.
+	ReplaceWithdrawalLastKey = "rwlast" + DirPathDelimiter // rwlast-{confirmedNonce} → last block a replaceWithdrawal ran for that withdrawal
 
 	// W4 Cluster C CRIT #9 (D-C-4 / v20 §BI): propose/execute timelock state.
 	// KeyProposalCounter holds the monotonic uint64 proposal id source.
@@ -50,7 +86,40 @@ const (
 
 const MaxBlockRetention = 101
 const MaxMPTProofNodes = 20
-const MaxMPTNodeSize = 4096
+// round3 C-RV: the per-node MaxMPTNodeSize=4096 cap was removed in R2-1 (it
+// wrongly rejected large legitimate receipt-trie leaves) and is now deleted as
+// dead code. The real ingress bound is MAX_TX_SIZE=16384 enforced by the
+// transaction-pool in go-vsc-node; the in-contract bound is MaxMPTProofNodes.
+
+// MED-66 (T2-7/CF-EVM-4) site 2: upper bound on the per-deposit instruction
+// list. routeDeposit iterates MapParams.Instructions and string-slices every
+// entry; without a cap an attacker pays dust for a deposit yet attaches a
+// huge instruction array, forcing unbounded per-element CPU work (bounded
+// only by WASM gas). Real routing needs at most a handful of directives
+// (deposit_to / swap_to / asset_out / destination_chain), so 16 is generous
+// headroom. Over the cap routeDeposit skips instruction parsing entirely and
+// credits the depositor's own derived DID.
+const MaxDepositInstructions = 16
+
+// MED-20 (M18-D9): upper bound on a registered token's MinWithdrawal. Without
+// a ceiling the owner could set MinWithdrawal=MaxInt64, which makes every
+// unmap of that token revert at the `amount < tokenInfo.MinWithdrawal` gate —
+// an admin-induced per-token DoS. 1e15 in token-native units is far above any
+// real per-tx minimum (1e9 USDC at 6 decimals) yet leaves headroom below the
+// downstream int64 fee/amount arithmetic.
+const MaxTokenMinWithdrawal = int64(1_000_000_000_000_000)
+
+// MED-21 (M18-D20): max byte length of a token symbol. The registry record is
+// pipe-delimited (`symbol|decimals|minWithdrawal`); an unbounded or
+// pipe-bearing symbol corrupts the positional parse. The length cap bounds
+// the stored record; the `|` rejection (handlers.go RegisterToken) preserves
+// the field structure.
+const MaxTokenSymbolLen = 32
+
+// MED-22 (M18-D21): sane ceiling for the operator-set gas reserve so a fat-
+// finger top-up cannot stamp an absurd reserve that later interacts with the
+// fee/refund math. 1e18 gwei = 1e9 ETH, far above any real reserve.
+const MaxGasReserve = int64(1_000_000_000_000_000_000)
 
 // Gas constants
 const ETHTransferGas = uint64(21_000)
@@ -78,6 +147,16 @@ const MinGasReserve = int64(50_000_000) // 0.05 ETH in GWEI minimum reserve
 // can submit `expireWithdrawal` once currentBlock >= pending.BlockHeight +
 // WithdrawalExpiryWindow with an L1-proof-of-drop per D-E-4.
 const WithdrawalExpiryWindow uint64 = 5000
+
+// MED-33 (M23-F16): minimum number of Hive blocks between two consecutive
+// replaceWithdrawal executions. replaceWithdrawal calls sdk.TssSignKey on
+// every invocation; without a cooldown, repeated execution burns TSS signing
+// resources unbounded (the propose/execute timelock rate-limits the FIRST
+// hop, but once a proposal is executable nothing stopped re-running it). A
+// stuck tx legitimately needs at most one fee-bump per few minutes; 200
+// blocks ≈ 10 minutes at Hive 3s cadence is comfortably above any real
+// re-broadcast cadence while capping the TSS request rate.
+const ReplaceWithdrawalCooldown uint64 = 200
 
 // W4 Cluster E §D-E-8 + Cluster B §BG: chain-gate state key set by
 // initContract when IsTestnet=true. clearTestnetState reads this key and

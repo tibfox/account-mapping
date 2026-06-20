@@ -55,13 +55,13 @@ const (
 	StatusExpired   uint8 = 3
 )
 
-// Timelock windows per W1 §D-C-3 (LOCKED).
-// Hive block cadence is ~3s; 28_800 blocks = 24h; 7_200 = 6h; 400_000 ≈ 14d.
+// Timelock windows per W1 §D-C-3 (LOCKED) are defined in timelock_windows_prod.go
+// (PRODUCTION, untagged: 400K / 28.8K / 7.2K / 0). They are overridden ONLY in a
+// devnet test build via timelock_windows_devnet.go (//go:build devnet_fasttimelock)
+// so setVerifierContract (TimelockLong) can be bootstrapped within a short devnet's
+// block budget. A production build (no tag) ALWAYS uses the LOCKED values; the real
+// timelock is tested separately on the untagged build (W6.3 admin / P2C-1).
 const (
-	TimelockLong        uint64 = 400_000 // Fund-affecting (~14 days)
-	TimelockTactical    uint64 = 28_800  // Operator-tactical (~24 hours)
-	TimelockOperational uint64 = 7_200   // Operational (~6 hours)
-	TimelockImmediate   uint64 = 0       // Emergency: pause / unpause
 	// Auto-expire window: execHeight + 7 days worth of blocks (2 * tactical).
 	// Per §D-C-4 "execHeight + 7 days (auto-expire)".
 	ExpireWindowBlocks uint64 = 201_600 // 7 days at 3s blocks
