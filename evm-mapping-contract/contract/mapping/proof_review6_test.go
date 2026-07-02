@@ -107,25 +107,17 @@ func computeERC20DedupHash(receipt []byte, txIndex uint32) [32]byte {
 }
 
 // ---------------------------------------------------------------------------
-// H9 — routeDeposit ignores instructions on native-ETH path
+// review6 follow-up — native-ETH intent from PROVEN calldata; ERC-20 restricted
 // ---------------------------------------------------------------------------
 
-// TestReview6_H9_RouteDepositETHIgnoresInstructions proves the fix in
-// handlers.go::routeDeposit:
-//
-//   - on the native-ETH path, the `for _, instr := range instructions` loop
-//     short-circuits with `if asset == "eth" { continue }` so neither
-//     `deposit_to=` nor `swap_to=`+`asset_out=` is honored;
-//   - on the ERC-20 path the same instructions ARE honored because the
-//     Transfer-log proof cryptographically binds the L1 depositor.
-//
-// A rogue/compromised whitelisted relayer (the gate on the ETH path) can
-// otherwise supply any `deposit_to=hive:attacker` and steal the credit
-// (HandleMap binds the proven L1 sender only — but routeDeposit pre-fix
-// returned the relayer-supplied destination instead).
-func TestReview6_H9_RouteDepositETHIgnoresInstructions(t *testing.T) {
-	// A reasonable, non-zero sender. Anything that DECODES as 20 bytes works;
-	// AddressToDID lowercases hex but does not validate checksum.
+// TestReview6Followup_RouteDepositETHHonorsInstructions is the INVERSE of the
+// old H9 test. Native-ETH instructions are now sourced from the PROVEN L1
+// calldata (parsedTx.Data) in HandleMap, so they are depositor-signed and
+// routeDeposit HONORS them. The trust boundary moved up to HandleMap
+// (parseCalldataInstructions); the old blunt "ignore all instructions for eth"
+// guard is gone. Here we verify the routing mechanics once instructions are
+// trusted.
+func TestReview6Followup_RouteDepositETHHonorsInstructions(t *testing.T) {
 	sender, err := crypto.HexToAddress("0xabc0000000000000000000000000000000000123")
 	if err != nil {
 		t.Fatal(err)
@@ -133,77 +125,80 @@ func TestReview6_H9_RouteDepositETHIgnoresInstructions(t *testing.T) {
 	const chainId uint64 = 1
 	expectedDID := crypto.AddressToDID(sender, chainId)
 
-	// Seed a router contract id so the swap branch CAN fire when an attacker
-	// asks for it. Without this seed, the swap branch returns `dest` for
-	// trivial reasons (routerIdPtr == nil) and a pre-fix bug would falsely
-	// look fixed.
 	sdk.ResetStubState()
 	sdk.StateSetObject(constants.RouterContractIdKey, "vsc1routerstub")
+	// selfAddr in the swap branch is "contract:" + env.ContractId.
+	sdk.StubSetEnvJSON(`{"contract.id":"vsc1self","msg.sender":"hive:relayer","msg.caller":"hive:relayer","block.height":1}`)
 	t.Cleanup(sdk.ResetStubState)
 
-	// If the swap branch were to fire, it would call contracts.call(routerId,
-	// "execute", ...). We install a responder that returns a non-nil success
-	// string so that, if the ETH-path fix were missing and the swap fired,
-	// routeDeposit would return "" — making the test fail LOUDLY.
-	successResponse := "ok"
+	// Responder so a dispatched swap returns success ("") rather than nil.
 	sdk.StubSetContractCallResponder(func(contractId, method, payload string) *string {
-		// If this fires on the ETH path, the test below will FAIL the dest check.
-		// Returning success lets us distinguish "swap fired" (returns "") from
-		// "swap did NOT fire" (returns the depositor DID).
-		s := successResponse
+		s := "ok"
 		return &s
 	})
 
-	t.Run("eth_path_ignores_deposit_to", func(t *testing.T) {
-		// Pre-fix: returned "hive:attacker". Post-fix: returns the L1-derived DID.
-		dest := routeDeposit(sender, []string{"deposit_to=hive:attacker"}, "eth", big.NewInt(100), chainId)
-		if dest != expectedDID {
-			t.Fatalf("H9 regression: ETH path honored deposit_to= ; got %q, want %q", dest, expectedDID)
+	t.Run("eth_honors_deposit_to", func(t *testing.T) {
+		// Old behavior: ignored, returned the DID. New: honored (calldata-signed).
+		dest := routeDeposit(sender, []string{"deposit_to=hive:bob"}, "eth", big.NewInt(100), chainId)
+		if dest != "hive:bob" {
+			t.Fatalf("ETH deposit_to must be honored (calldata-sourced, trusted); got %q, want %q", dest, "hive:bob")
 		}
 	})
 
-	t.Run("eth_path_ignores_swap_to_plus_asset_out", func(t *testing.T) {
-		// Pre-fix: swap branch fires, returns "" (swap dispatched to router with
-		// Recipient=hive:attacker). Post-fix: instruction loop skips, swap
-		// branch never fires, returns the L1-derived DID.
-		dest := routeDeposit(sender, []string{"swap_to=hive:attacker", "asset_out=hbd"}, "eth", big.NewInt(100), chainId)
-		if dest != expectedDID {
-			t.Fatalf("H9 regression: ETH path swap branch fired ; got %q, want %q (the swap branch must not run on native ETH)", dest, expectedDID)
+	t.Run("eth_dispatches_swap", func(t *testing.T) {
+		// swap_to + asset_out now reaches the DEX dispatch on the ETH path and
+		// returns "" (routeDeposit credited the funds into the swap).
+		dest := routeDeposit(sender, []string{"swap_to=hive:bob", "asset_out=hbd"}, "eth", big.NewInt(100), chainId)
+		if dest != "" {
+			t.Fatalf("ETH swap must dispatch and return \"\"; got %q", dest)
 		}
 	})
 
-	t.Run("eth_path_ignores_combined_destination_chain", func(t *testing.T) {
-		// Defense-in-depth: even with destination_chain= mixed in, the ETH
-		// path must continue to ignore the entire instruction set.
-		dest := routeDeposit(sender, []string{
-			"deposit_to=hive:attacker",
-			"swap_to=hive:attacker2",
-			"asset_out=hbd",
-			"destination_chain=hive",
-		}, "eth", big.NewInt(100), chainId)
-		if dest != expectedDID {
-			t.Fatalf("H9 regression: ETH path honored mixed instructions ; got %q, want %q", dest, expectedDID)
-		}
-	})
-
-	t.Run("erc20_path_honors_deposit_to", func(t *testing.T) {
-		// Companion check: the fix MUST NOT regress the ERC-20 path. With
-		// an ERC-20 deposit, the Transfer-log proof binds the depositor, so
-		// routing to a different L2 destination via deposit_to= is safe.
-		dest := routeDeposit(sender, []string{"deposit_to=hive:legitrecipient"}, "usdc", big.NewInt(100), chainId)
-		if dest != "hive:legitrecipient" {
-			t.Fatalf("H9 ERC-20 regression: deposit_to= must be honored on ERC-20 path; got %q", dest)
-		}
-	})
-
-	t.Run("eth_path_no_instructions_returns_did", func(t *testing.T) {
-		// Sanity: empty instruction list returns the depositor DID. Same
-		// result as ETH+instructions because the fix nullifies them.
+	t.Run("eth_no_instructions_returns_did", func(t *testing.T) {
 		dest := routeDeposit(sender, nil, "eth", big.NewInt(100), chainId)
 		if dest != expectedDID {
-			t.Fatalf("H9 sanity: ETH with no instructions; got %q, want %q", dest, expectedDID)
+			t.Fatalf("ETH with no instructions must credit the sender DID; got %q, want %q", dest, expectedDID)
 		}
 	})
+}
+
+// TestReview6Followup_ParseCalldataInstructions pins the calldata wire format:
+// UTF-8 "key=value" pairs joined by '&'; empty calldata yields no instructions.
+func TestReview6Followup_ParseCalldataInstructions(t *testing.T) {
+	if got := parseCalldataInstructions(nil); got != nil {
+		t.Fatalf("empty calldata must yield nil instructions, got %v", got)
+	}
+	if got := parseCalldataInstructions([]byte("")); got != nil {
+		t.Fatalf("zero-length calldata must yield nil, got %v", got)
+	}
+	got := parseCalldataInstructions([]byte("swap_to=hive:alice&asset_out=hbd"))
+	if len(got) != 2 || got[0] != "swap_to=hive:alice" || got[1] != "asset_out=hbd" {
+		t.Fatalf("unexpected parse: %v", got)
+	}
+	// Empty segments (leading / trailing / doubled '&') are dropped.
+	got = parseCalldataInstructions([]byte("&deposit_to=hive:bob&&"))
+	if len(got) != 1 || got[0] != "deposit_to=hive:bob" {
+		t.Fatalf("empty segments must be dropped, got %v", got)
+	}
+}
+
+// TestReview6Followup_ToReserveDetection pins the to_reserve trigger.
+func TestReview6Followup_ToReserveDetection(t *testing.T) {
+	if !hasToReserveInstruction([]string{"to_reserve=1"}) {
+		t.Fatal("to_reserve=1 must trigger reserve funding")
+	}
+	if !hasToReserveInstruction([]string{"swap_to=x", "to_reserve=true"}) {
+		t.Fatal("to_reserve=true must trigger reserve funding")
+	}
+	if hasToReserveInstruction([]string{"to_reserve=0"}) {
+		t.Fatal("to_reserve=0 must NOT trigger")
+	}
+	if hasToReserveInstruction([]string{"deposit_to=hive:bob"}) {
+		t.Fatal("unrelated instruction must NOT trigger reserve funding")
+	}
+	if hasToReserveInstruction(nil) {
+		t.Fatal("nil instructions must NOT trigger")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +240,7 @@ func TestReview6_H10_EarlyGuards(t *testing.T) {
 	t.Run("e2_unknown_type_rejected", func(t *testing.T) {
 		// Need a header lookup to succeed first; seed one.
 		sdk.StateSetObject(constants.VerifierContractIdKey, "vsc1verifierstub")
-		hdrSerialized := serializeHeader(/*block=*/ 100, chainId, [32]byte{}, [32]byte{}, [32]byte{})
+		hdrSerialized := serializeHeader( /*block=*/ 100, chainId, [32]byte{}, [32]byte{}, [32]byte{})
 		hdrKey := constants.BlockPrefix + uintToStr(100)
 		sdk.StubSetContractReadResponder(func(cid, key string) *string {
 			if cid == "vsc1verifierstub" && key == hdrKey {
@@ -421,7 +416,7 @@ func TestReview6_H10_TypeADeepNonceChainSender(t *testing.T) {
 	}
 
 	t.Run("g4_chain_id_mismatch", func(t *testing.T) {
-		txBytes, txRoot, txNodes := buildAnchoredTx(/*chainId=*/ 9999, /*nonce=*/ 7)
+		txBytes, txRoot, txNodes := buildAnchoredTx( /*chainId=*/ 9999 /*nonce=*/, 7)
 		hdr := serializeHeader(proofBlock, contractChainId, [32]byte{}, txRoot, receiptsRoot)
 		hdrKey := constants.BlockPrefix + uintToStr(proofBlock)
 		sdk.StateSetObject(constants.VerifierContractIdKey, "vsc1verifierstub")
@@ -456,7 +451,7 @@ func TestReview6_H10_TypeADeepNonceChainSender(t *testing.T) {
 		// proof.TxNonce matches ps.Nonce (so the early guard passes) but
 		// the SIGNED tx anchored to the trie has a different nonce —
 		// exactly the forgery class H10 was added to close.
-		txBytes, txRoot, txNodes := buildAnchoredTx(/*chainId=*/ contractChainId, /*signedNonce=*/ 13)
+		txBytes, txRoot, txNodes := buildAnchoredTx( /*chainId=*/ contractChainId /*signedNonce=*/, 13)
 		hdr := serializeHeader(proofBlock, contractChainId, [32]byte{}, txRoot, receiptsRoot)
 		hdrKey := constants.BlockPrefix + uintToStr(proofBlock)
 		sdk.StateSetObject(constants.VerifierContractIdKey, "vsc1verifierstub")
@@ -491,7 +486,7 @@ func TestReview6_H10_TypeADeepNonceChainSender(t *testing.T) {
 		// Everything matches EXCEPT ps.VaultAtQueue is set to a different
 		// address than the signer of the proven tx. Pre-fix this would
 		// silently pass; post-fix it must reject with the new sender guard.
-		txBytes, txRoot, txNodes := buildAnchoredTx(/*chainId=*/ contractChainId, /*signedNonce=*/ 7)
+		txBytes, txRoot, txNodes := buildAnchoredTx( /*chainId=*/ contractChainId /*signedNonce=*/, 7)
 		hdr := serializeHeader(proofBlock, contractChainId, [32]byte{}, txRoot, receiptsRoot)
 		hdrKey := constants.BlockPrefix + uintToStr(proofBlock)
 		sdk.StateSetObject(constants.VerifierContractIdKey, "vsc1verifierstub")
@@ -564,10 +559,10 @@ var _ = hex.EncodeToString
 func buildRevertedReceiptRLP() []byte {
 	bloom := make([]byte, 256)
 	return rlp.EncodeList(
-		rlp.EncodeUint64(0),     // status = 0 (reverted)
-		rlp.EncodeUint64(0),     // cumulativeGasUsed
-		rlp.EncodeBytes(bloom),  // bloom (zeros)
-		rlp.EncodeList(),        // logs (empty list)
+		rlp.EncodeUint64(0),    // status = 0 (reverted)
+		rlp.EncodeUint64(0),    // cumulativeGasUsed
+		rlp.EncodeBytes(bloom), // bloom (zeros)
+		rlp.EncodeList(),       // logs (empty list)
 	)
 }
 

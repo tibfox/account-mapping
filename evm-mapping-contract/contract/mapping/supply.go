@@ -79,10 +79,11 @@ func SetSupply(asset string, s Supply) {
 //
 // userAmount    — the portion credited to the depositor's ledger balance.
 // reserveAmount — the portion diverted to the gas reserve (the 1% ETH
-//                 deposit tax; pass 0 for ERC-20). It stays in custody, so
-//                 Active includes it, but it is NOT user-attributed and NOT
-//                 a Magi revenue fee — Fee is untouched. The reserve
-//                 counter itself is maintained separately (addGasReserve).
+//
+//	deposit tax; pass 0 for ERC-20). It stays in custody, so
+//	Active includes it, but it is NOT user-attributed and NOT
+//	a Magi revenue fee — Fee is untouched. The reserve
+//	counter itself is maintained separately (addGasReserve).
 func TrackDeposit(asset string, userAmount, reserveAmount *big.Int) {
 	s := GetSupply(asset)
 	delta := new(big.Int).Add(userAmount, reserveAmount)

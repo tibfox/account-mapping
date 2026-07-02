@@ -37,23 +37,23 @@ func VerifyETHDeposit(
 	req *VerificationRequest,
 	vaultAddress [20]byte,
 	chainId uint64,
-) ([20]byte, []byte, [32]byte, error) {
+) ([20]byte, []byte, []byte, [32]byte, error) {
 	var sender [20]byte
 	var txHash [32]byte
 
 	header := blocklist.GetHeader(req.BlockHeight)
 	if header == nil {
-		return sender, nil, txHash, ErrBlockNotFound
+		return sender, nil, nil, txHash, ErrBlockNotFound
 	}
 
 	rawBytes, err := hex.DecodeString(req.RawHex)
 	if err != nil {
-		return sender, nil, txHash, ce.WrapContractError(ce.ErrInvalidHex, err, "raw_hex")
+		return sender, nil, nil, txHash, ce.WrapContractError(ce.ErrInvalidHex, err, "raw_hex")
 	}
 
 	proofBytes, err := hex.DecodeString(req.MerkleProofHex)
 	if err != nil {
-		return sender, nil, txHash, ce.WrapContractError(ce.ErrInvalidHex, err, "merkle_proof_hex")
+		return sender, nil, nil, txHash, ce.WrapContractError(ce.ErrInvalidHex, err, "merkle_proof_hex")
 	}
 
 	proof := splitProofNodes(proofBytes)
@@ -61,12 +61,12 @@ func VerifyETHDeposit(
 
 	value, err := mpt.VerifyProof(header.TransactionsRoot, key, proof)
 	if err != nil {
-		return sender, nil, txHash, ErrProofFailed
+		return sender, nil, nil, txHash, ErrProofFailed
 	}
 
 	// Verify the proven value matches the raw TX
 	if !bytesEqual(value, rawBytes) {
-		return sender, nil, txHash, ErrProofFailed
+		return sender, nil, nil, txHash, ErrProofFailed
 	}
 
 	// Compute TX hash for observed tracking
@@ -74,13 +74,13 @@ func VerifyETHDeposit(
 
 	// Check not already observed
 	if IsObserved(req.BlockHeight, txHash, uint16(req.TxIndex)) {
-		return sender, nil, txHash, ErrAlreadyObserved
+		return sender, nil, nil, txHash, ErrAlreadyObserved
 	}
 
 	// Parse the transaction to extract to, value, and signature
 	parsedTx, err := parseTransaction(rawBytes)
 	if err != nil {
-		return sender, nil, txHash, err
+		return sender, nil, nil, txHash, err
 	}
 
 	// W4 Cluster B CRIT #6 Site 1: reject wrong-chain deposit proofs.
@@ -88,12 +88,12 @@ func VerifyETHDeposit(
 	// ChainId from the canonical RLP; this check rejects cross-chain replay
 	// BEFORE ecrecover spends any cycles.
 	if parsedTx.ChainId != chainId {
-		return sender, nil, txHash, ErrChainIdMismatch
+		return sender, nil, nil, txHash, ErrChainIdMismatch
 	}
 
 	// Verify destination is vault
 	if parsedTx.To != vaultAddress {
-		return sender, nil, txHash, ErrNotVaultDeposit
+		return sender, nil, nil, txHash, ErrNotVaultDeposit
 	}
 
 	// Recover sender via ecrecover
@@ -107,10 +107,10 @@ func VerifyETHDeposit(
 	// envelope SYSTEM sigs require.
 	sender, err = crypto.EcrecoverCanonical(sighash, recoveryV, rPadded, sPadded)
 	if err != nil {
-		return sender, nil, txHash, ce.Prepend(err, "ecrecover failed")
+		return sender, nil, nil, txHash, ce.Prepend(err, "ecrecover failed")
 	}
 	if sender == ([20]byte{}) {
-		return sender, nil, txHash, ce.NewContractError(ce.ErrTransaction, "ecrecover returned zero address")
+		return sender, nil, nil, txHash, ce.NewContractError(ce.ErrTransaction, "ecrecover returned zero address")
 	}
 
 	// CRIT #8 / W4 Cluster A: MarkObserved is NOT called here. HandleMap
@@ -122,7 +122,7 @@ func VerifyETHDeposit(
 	// L1 tx value (big-endian wei) is returned verbatim — no gwei truncation
 	// boundary. HandleMap reconstructs it via big.Int.SetBytes and credits the
 	// exact wei amount.
-	return sender, parsedTx.Value, txHash, nil
+	return sender, parsedTx.Value, parsedTx.Data, txHash, nil
 }
 
 // VerifyERC20Deposit verifies an ERC-20 deposit via receipt inclusion proof.

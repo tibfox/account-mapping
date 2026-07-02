@@ -53,6 +53,7 @@ type TokenInfo struct {
 //  1. Entry-point intent binding (all 4 IntentX must equal PendingSpend)
 //  2. recoveredSender == ps.VaultAtQueue (snapshotted vault from Cluster F)
 //  3. parsedTx.To / parsedTx.Value / asset binding (defense-in-depth)
+//
 // Wire-format authority: `confirmSpendSchema()` wasmexport in main.go
 // returns this struct's canonical schema JSON for bot startup introspection.
 type ConfirmSpendRequest struct {
@@ -74,18 +75,18 @@ type ConfirmSpendRequest struct {
 // L1ProofOfDrop — W4 Cluster E CRIT #26 + CRIT #27 (D-E-4 LOCKED). One of
 // TWO proof shapes is accepted; bot supplies whichever it can construct:
 //
-//  - Type A "reverted-receipt": receipt-trie MPT proof showing the L1 tx
-//    at the cleared/expired nonce was mined with `status=0` (reverted).
-//    Reuses the receipt-trie infrastructure from HandleConfirmSpend
-//    (CRIT #1).
+//   - Type A "reverted-receipt": receipt-trie MPT proof showing the L1 tx
+//     at the cleared/expired nonce was mined with `status=0` (reverted).
+//     Reuses the receipt-trie infrastructure from HandleConfirmSpend
+//     (CRIT #1).
 //
-//  - Type B "block-inclusion-without-tx": prove that block at FinalizedHeight
-//    is finalized AND does NOT contain a tx at TxIndex matching the
-//    expired nonce. Requires a transactions-trie proof PLUS a finality
-//    attestation (encoded as the ZK-verified block header read via
-//    blocklist.GetHeader; the L1 finality is anchored by the SP1 Helios
-//    Groth16 light client — the ZK architecture note above is the trust
-//    root, NOT an external RPC).
+//   - Type B "block-inclusion-without-tx": prove that block at FinalizedHeight
+//     is finalized AND does NOT contain a tx at TxIndex matching the
+//     expired nonce. Requires a transactions-trie proof PLUS a finality
+//     attestation (encoded as the ZK-verified block header read via
+//     blocklist.GetHeader; the L1 finality is anchored by the SP1 Helios
+//     Groth16 light client — the ZK architecture note above is the trust
+//     root, NOT an external RPC).
 //
 // LOCKED wire format (this manifest — closes the W1 deferral flagged in
 // MILO-REVIEW §1 Cluster E CONCERNS):
@@ -108,29 +109,29 @@ type ConfirmSpendRequest struct {
 //	}
 //
 // Verification path (mirrors HandleConfirmSpend's MPT verify):
-//  - Type A: blocklist.GetHeader(BlockHeight) → header.ReceiptsRoot →
-//    mpt.VerifyProof(rcptRoot, rlp(TxIndex), proofNodes) → receipt.Status == 0
-//    AND receipt's parsed nonce field MUST equal TxNonce. Reject otherwise.
-//  - Type B: blocklist.GetHeader(BlockHeight) → header.TransactionsRoot →
-//    mpt.VerifyProof(txRoot, rlp(TxIndex), proofNodes) → parseTransaction(...)
-//    → parsed.Nonce > TxNonce  (i.e. the slot is occupied by a HIGHER nonce
-//    from the same vault, which proves the original tx at TxNonce was
-//    dropped/replaced and the gap is closed). If TxIndex slot is empty
-//    (proof returns nil), reject — bot must use Type A in that case.
+//   - Type A: blocklist.GetHeader(BlockHeight) → header.ReceiptsRoot →
+//     mpt.VerifyProof(rcptRoot, rlp(TxIndex), proofNodes) → receipt.Status == 0
+//     AND receipt's parsed nonce field MUST equal TxNonce. Reject otherwise.
+//   - Type B: blocklist.GetHeader(BlockHeight) → header.TransactionsRoot →
+//     mpt.VerifyProof(txRoot, rlp(TxIndex), proofNodes) → parseTransaction(...)
+//     → parsed.Nonce > TxNonce  (i.e. the slot is occupied by a HIGHER nonce
+//     from the same vault, which proves the original tx at TxNonce was
+//     dropped/replaced and the gap is closed). If TxIndex slot is empty
+//     (proof returns nil), reject — bot must use Type A in that case.
 //
 // Mainnet/testnet posture: both types require a header already anchored
 // via the ZK light client (per the ZK architecture note above). The bot
 // MUST NOT supply a header that has not been ingested by HandleAddBlocks.
 type L1ProofOfDrop struct {
-	Type                string `json:"type"`                  // "reverted_receipt" or "block_inclusion_without_tx"
-	BlockHeight         uint64 `json:"block_height"`          // finalized L1 height
-	TxIndex             uint64 `json:"tx_index"`              // index within block
-	TxNonce             uint64 `json:"tx_nonce"`              // L1 nonce being cleared
-	ReceiptHex          string `json:"receipt_hex,omitempty"` // type A
-	ReceiptProofHex     string `json:"receipt_proof_hex,omitempty"`
-	TxAtIndexHex        string `json:"tx_at_index_hex,omitempty"` // type B
-	TxProofHex          string `json:"tx_proof_hex,omitempty"`
-	VaultNonceProofHex  string `json:"vault_nonce_proof_hex,omitempty"` // optional safety hint (type B)
+	Type               string `json:"type"`                  // "reverted_receipt" or "block_inclusion_without_tx"
+	BlockHeight        uint64 `json:"block_height"`          // finalized L1 height
+	TxIndex            uint64 `json:"tx_index"`              // index within block
+	TxNonce            uint64 `json:"tx_nonce"`              // L1 nonce being cleared
+	ReceiptHex         string `json:"receipt_hex,omitempty"` // type A
+	ReceiptProofHex    string `json:"receipt_proof_hex,omitempty"`
+	TxAtIndexHex       string `json:"tx_at_index_hex,omitempty"` // type B
+	TxProofHex         string `json:"tx_proof_hex,omitempty"`
+	VaultNonceProofHex string `json:"vault_nonce_proof_hex,omitempty"` // optional safety hint (type B)
 }
 
 // L1ProofTypeRevertedReceipt / L1ProofTypeBlockInclusion — canonical type
@@ -172,14 +173,14 @@ type CancelMyWithdrawalParams struct {
 
 // Parsed EIP-1559 transaction fields
 type ParsedTx struct {
-	ChainId  uint64
-	Nonce    uint64
-	To       [20]byte
-	Value    []byte // big-endian uint256
-	Data     []byte
-	V        byte
-	R        []byte
-	S        []byte
+	ChainId uint64
+	Nonce   uint64
+	To      [20]byte
+	Value   []byte // big-endian uint256
+	Data    []byte
+	V       byte
+	R       []byte
+	S       []byte
 }
 
 // DexInstruction for swap routing

@@ -14,10 +14,10 @@ import (
 // The audit (EVM-FORK-CROSSREF-ALLMETHODS-AUDIT-2026-06-02.md §C1) framed
 // the bug as:
 //
-//   "env.BlockHeight (Hive ≈106M) > ps.BlockHeight+5000 (ETH ≈22M+5000)
-//    so env.BlockHeight < expiryHeight is always FALSE → post-window
-//    branch → proof OPTIONAL; any account calls expireWithdrawal(nonce,
-//    {}) with empty proof."
+//	"env.BlockHeight (Hive ≈106M) > ps.BlockHeight+5000 (ETH ≈22M+5000)
+//	 so env.BlockHeight < expiryHeight is always FALSE → post-window
+//	 branch → proof OPTIONAL; any account calls expireWithdrawal(nonce,
+//	 {}) with empty proof."
 //
 // The review6 fix (F3b) makes the L1-proof-of-drop MANDATORY in ALL
 // branches — both pre-window AND post-window. This test sets up a
@@ -38,15 +38,15 @@ func TestReview6_C1_HandleExpireWithdrawal_EmptyProofRejected(t *testing.T) {
 	}{
 		{
 			name:          "pre-window: env.BlockHeight < expiryHeight",
-			envBlock:      10,             // hive height very low
-			psBlockHeight: 100,            // eth height; expiry = 100+5000 = 5100
-			callerIsOwner: true,           // pre-window requires original withdrawer
+			envBlock:      10,   // hive height very low
+			psBlockHeight: 100,  // eth height; expiry = 100+5000 = 5100
+			callerIsOwner: true, // pre-window requires original withdrawer
 		},
 		{
 			name:          "post-window: env.BlockHeight >= expiryHeight (audit's C1 path)",
-			envBlock:      1_000_000_000,  // hive height huge — simulates mainnet domain mismatch
-			psBlockHeight: 100,            // eth height; expiry = 100+5000 = 5100; 1B > 5100
-			callerIsOwner: false,          // post-window: anyone may call
+			envBlock:      1_000_000_000, // hive height huge — simulates mainnet domain mismatch
+			psBlockHeight: 100,           // eth height; expiry = 100+5000 = 5100; 1B > 5100
+			callerIsOwner: false,         // post-window: anyone may call
 		},
 		{
 			name:          "post-window: original withdrawer too",
@@ -92,7 +92,7 @@ func TestReview6_C1_HandleExpireWithdrawal_EmptyProofRejected(t *testing.T) {
 			ps := PendingSpend{
 				Nonce:        0,
 				Amount:       big.NewInt(1_000_000_000), // arbitrary positive amount (wei on this base)
-				From:         userDID,       // user owns the pending spend
+				From:         userDID,                   // user owns the pending spend
 				To:           "0xdead000000000000000000000000000000000001",
 				Asset:        "eth",
 				BlockHeight:  tt.psBlockHeight, // ETH-domain height

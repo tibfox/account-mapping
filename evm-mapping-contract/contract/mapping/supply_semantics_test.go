@@ -160,3 +160,39 @@ func TestSupply_ERC20GasComesFromEthCustody(t *testing.T) {
 		t.Fatalf("token supply must be empty after unmap: Active=%s User=%s", sTok.Active, sTok.User)
 	}
 }
+
+// TestSupply_ToReserveDepositFundsReserveAndActive — a native-ETH deposit
+// carrying to_reserve routes the WHOLE amount into both the reserve counter and
+// Active("eth"), crediting no user. This is the proof-backed reserve-funding
+// path (HandleMap's to_reserve branch) that replaces a bare setGasReserve
+// write: because Active grows alongside the reserve, a subsequent ERC-20 reserve
+// spend (TrackReserveSpend) proceeds instead of aborting — the divergence that
+// a setGasReserve-only seed (Active=0) would have caused.
+func TestSupply_ToReserveDepositFundsReserveAndActive(t *testing.T) {
+	sdk.ResetTestStateStore()
+
+	fund := big.NewInt(constants.MinGasReserve) // 0.05 ETH
+
+	// Mirror HandleMap's to_reserve branch: addGasReserve + TrackDeposit(0, fund).
+	addGasReserve(fund)
+	TrackDeposit("eth", new(big.Int), fund)
+
+	if got := getGasReserve(); got.Cmp(fund) != 0 {
+		t.Fatalf("reserve must hold the full to_reserve amount: want %s, got %s", fund, got)
+	}
+	s := GetSupply("eth")
+	if s.Active.Cmp(fund) != 0 {
+		t.Fatalf("Active(eth) must grow by the to_reserve amount: want %s, got %s", fund, s.Active)
+	}
+	if s.User.Sign() != 0 {
+		t.Fatalf("to_reserve must NOT credit any user: got User=%s", s.User)
+	}
+	ethInvariant(t, "after to_reserve deposit")
+
+	// The payoff: an ERC-20 reserve spend now proceeds (Active >= gasCost),
+	// where a bare setGasReserve seed (Active=0) would have aborted here.
+	gasCost := big.NewInt(3_900_000_000_000_000)
+	deductGasReserve(gasCost)
+	TrackReserveSpend(gasCost) // must NOT abort
+	ethInvariant(t, "after erc20 reserve spend")
+}

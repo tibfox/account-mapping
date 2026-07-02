@@ -75,8 +75,9 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 			return ce.NewContractError(ce.ErrAuth, "native ETH deposit: caller is not a whitelisted relayer")
 		}
 		// W4 Cluster B CRIT #6 Site 1: chainId passed in so VerifyETHDeposit
-		// can reject wrong-chain txs before any state mutation.
-		sender, amountBytes, txHash, err := VerifyETHDeposit(req, vaultAddress, chainId)
+		// can reject wrong-chain txs before any state mutation. calldata is the
+		// PROVEN L1 tx data field — the depositor-signed routing-intent channel.
+		sender, amountBytes, calldata, txHash, err := VerifyETHDeposit(req, vaultAddress, chainId)
 		if err != nil {
 			return err
 		}
@@ -86,25 +87,44 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 			return ce.NewContractError(ce.ErrInput, "deposit amount must be positive")
 		}
 
-		// review6 H9: thread chainId so native-ETH credit derives the DID from
-		// the deposit chain and deposit_to is ignored for eth (see routeDeposit).
-		dest := routeDeposit(sender, params.Instructions, "eth", amount, chainId)
+		// review6 follow-up: native-ETH routing intent is read from the PROVEN
+		// L1 calldata (parsedTx.Data), which the depositor signed over — NOT
+		// from params.Instructions, which the relayer supplies and could forge.
+		// Empty calldata => no instructions => credit the sender's derived DID.
+		instructions := parseCalldataInstructions(calldata)
+
+		// to_reserve: the depositor directs the WHOLE deposit into the gas
+		// reserve (proof-backed reserve funding). No user credit; Active and the
+		// reserve grow together, preserving Active == User + Fee + reserve — the
+		// trust-minimized replacement for a bare setGasReserve write.
+		if hasToReserveInstruction(instructions) {
+			addGasReserve(amount)
+			TrackDeposit("eth", new(big.Int), amount)
+			MarkObserved(req.BlockHeight, txHash, uint16(req.TxIndex))
+			return nil
+		}
 
 		// Gas reserve tax: bps of ETH deposits, credited in full wei. big.Int
 		// keeps exact precision (Div truncates toward zero) with no overflow.
+		// Taken off the top BEFORE routing so the credit/swap and the supply
+		// accounting all operate on the same net amount.
 		gasTax := new(big.Int).Div(
 			new(big.Int).Mul(amount, big.NewInt(constants.GasReserveDepositTaxBps)),
 			big.NewInt(10000),
 		)
+		netAmount := new(big.Int).Sub(amount, gasTax)
 		if gasTax.Sign() > 0 {
 			addGasReserve(gasTax)
-			amount.Sub(amount, gasTax)
 		}
 
+		// Honor the depositor-signed instructions: deposit_to redirect, or a
+		// swap_to/asset_out DEX swap. routeDeposit returns the L2 destination,
+		// or "" when it dispatched the swap (which already credited the funds).
+		dest := routeDeposit(sender, instructions, "eth", netAmount, chainId)
 		if dest != "" {
-			IncBalance(dest, "eth", amount)
+			IncBalance(dest, "eth", netAmount)
 		}
-		TrackDeposit("eth", amount, gasTax)
+		TrackDeposit("eth", netAmount, gasTax)
 		// CRIT #8 / W4 Cluster A: lock the observed slot only after the
 		// deposit has been fully routed + credited + accounted. If any
 		// earlier step errors, the slot stays open for the next attempt.
@@ -135,12 +155,15 @@ func HandleMap(params *MapParams, vaultAddress [20]byte, chainId uint64) error {
 			return ce.NewContractError(ce.ErrArithmetic, "deposit amount invalid")
 		}
 
-		// review6 H9: ERC-20 still honors deposit_to (Transfer-log proof binds
-		// the depositor); chainId is threaded for the AddressToDID binding.
-		dest := routeDeposit(sender, params.Instructions, tokenInfo.Symbol, amount, chainId)
-		if dest != "" {
-			IncBalance(dest, tokenInfo.Symbol, amount)
-		}
+		// review6 follow-up: ERC-20 deposits settle ONLY to the sender's derived
+		// Magi account. A standard ERC-20 transfer exposes no depositor-signed
+		// intent channel — the bridge proves a fixed-schema Transfer event, not
+		// the depositor's calldata — so relayer-supplied instructions are
+		// untrusted and ignored here. Cross-account routing / swaps for tokens
+		// require a future depositor-signed mechanism (e.g. a deposit-wrapper
+		// EVM contract that emits an instruction-bearing event).
+		dest := crypto.AddressToDID(sender, chainId)
+		IncBalance(dest, tokenInfo.Symbol, amount)
 		TrackDeposit(tokenInfo.Symbol, amount, new(big.Int))
 		// CRIT #8 / W4 Cluster A + CRIT #14 logIndex: lock observed slot
 		// only after routing + credit succeed.
@@ -661,42 +684,56 @@ func HandleApprove(params *AllowanceParams) error {
 
 // Helpers
 
-// routeDeposit returns the L2 destination + (optionally) routes the deposit
-// through the registered DEX for swap_to / asset_out instructions.
+// parseCalldataInstructions interprets the PROVEN L1 transaction calldata of a
+// native-ETH deposit (parsedTx.Data) as the depositor's routing instructions.
+// Because the calldata is part of the depositor's signed, MPT-proven
+// transaction, these instructions are bound to the depositor — unlike the
+// relayer-supplied params.Instructions, which are no longer trusted or read.
 //
-// review6 H9: the `deposit_to=<addr>` instruction is now HONORED ONLY for
-// ERC-20 deposits, where the Transfer-log proof cryptographically binds the
-// depositor — so a relayer-supplied destination is verifiable. For native
-// ETH deposits, the L1 sender (recovered via ecrecover on the proven raw
-// tx) is the ONLY trusted depositor signal; the caller (whitelisted L2
-// relayer) MUST credit the sender's derived DID. Pre-fix, a rogue/
-// compromised relayer could pass any `deposit_to=<attacker>` and redirect
-// the credit, since IsWhitelistedRelayer is a coarse trust gate that does
-// NOT bind to the actual L1 depositor.
+// Wire format: UTF-8 "key=value" pairs separated by '&' (query-string style),
+// e.g. "deposit_to=hive:alice", "swap_to=hive:alice&asset_out=hbd", or
+// "to_reserve=1". A plain ETH transfer carries empty calldata, which yields no
+// instructions and credits the sender's derived DID.
+func parseCalldataInstructions(calldata []byte) []string {
+	if len(calldata) == 0 {
+		return nil
+	}
+	parts := strings.Split(string(calldata), "&")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// hasToReserveInstruction reports whether the depositor asked to route the whole
+// deposit into the ETH gas reserve. Takes precedence over any other instruction.
+func hasToReserveInstruction(instructions []string) bool {
+	for _, instr := range instructions {
+		if instr == "to_reserve=1" || instr == "to_reserve=true" {
+			return true
+		}
+	}
+	return false
+}
+
+// routeDeposit returns the L2 destination for a deposit, or dispatches a DEX
+// swap (returning "") when swap_to/asset_out instructions are present.
 //
-// chainId is now threaded for the AddressToDID-vs-deposit-chain binding
-// (M3 in the audit's open issues): pre-fix this was hardcoded to 1, which
-// gives the wrong DID on non-mainnet L1s.
+// review6 follow-up: callers pass ONLY depositor-authorized instructions.
+// Native ETH sources them from the PROVEN L1 calldata (parseCalldataInstructions
+// in HandleMap), so honoring deposit_to / swap_to here is safe — the depositor
+// signed them. ERC-20 no longer calls routeDeposit at all (it settles to the
+// sender's DID) because a Transfer event carries no depositor-signed intent.
+// chainId is threaded so the default DID derives from the deposit chain.
 func routeDeposit(sender [20]byte, instructions []string, asset string, amount *big.Int, chainId uint64) string {
 	did := crypto.AddressToDID(sender, chainId)
 	dest := did
 	var swapTo, assetOut, destChain string
 
-	// review6 H9 (adversarial-review correction): ALL instruction-driven
-	// destination control is disabled for native ETH. The prior fix only
-	// blocked `deposit_to=`; `swap_to=<attacker>&asset_out=<asset>` was
-	// still honored, dispatching the DEX swap with `Recipient: swapTo` —
-	// equivalent to redirecting the credit. A rogue/compromised
-	// whitelisted relayer can choose any swap_to. params.Instructions is
-	// L2-relayer-supplied (NOT extracted from L1 calldata) so the
-	// depositor never consented.
-	//
-	// ERC-20 keeps all instruction support because the Transfer-log proof
-	// cryptographically binds the L1 depositor — the relayer can't redirect.
 	for _, instr := range instructions {
-		if asset == "eth" {
-			continue
-		}
 		if len(instr) > 11 && instr[:11] == "deposit_to=" {
 			dest = instr[11:]
 		}
@@ -1133,6 +1170,7 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 //     input entirely with `_ *string`);
 //   - assertNotPaused gate (CRIT #27);
 //   - returns error instead of mid-flow sdk.Revert.
+//
 // refundDroppedWithdrawal makes the withdrawer whole for a PendingSpend
 // whose L1 tx has been PROVEN dropped (verifyL1ProofOfDrop passed): the tx
 // never executed, so NOTHING left custody. Shared by all three escape
