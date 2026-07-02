@@ -222,18 +222,31 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	// big.Int/wei: the fee is full wei, same denomination as amount/balance.
 	fee := feeWei
 
-	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds.
-	totalDeduct := new(big.Int).Set(amount)
-	if !params.DeductFee {
-		totalDeduct.Add(amount, fee)
+	// l1Value is what the signed L1 tx sends; userDebit is what the caller
+	// pays on Magi. Uniform invariant either way: userDebit == l1Value + fee.
+	//   DeductFee=false (fee on top):  l1Value = amount,       userDebit = amount + fee
+	//   DeductFee=true  (fee netted):  l1Value = amount - fee, userDebit = amount
+	// This makes every downstream path mode-agnostic: a reverted L1 tx
+	// returns l1Value to the vault (refund ps.Amount); a proven-dropped tx
+	// spent nothing (refund ps.Amount + ps.GasCost).
+	l1Value := new(big.Int).Set(amount)
+	userDebit := new(big.Int).Set(amount)
+	if params.DeductFee {
+		l1Value.Sub(l1Value, fee)
+		if l1Value.Sign() <= 0 {
+			return "", ce.NewContractError(ce.ErrIntent, "amount does not cover the L1 fee")
+		}
+	} else {
+		userDebit.Add(amount, fee)
 	}
-	if GetBalance(caller, "eth").Cmp(totalDeduct) < 0 {
+
+	// Check balance BEFORE signing to prevent signed TX leak on insufficient funds.
+	if GetBalance(caller, "eth").Cmp(userDebit) < 0 {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient balance")
 	}
 
 	nonce := GetPendingNonce()
-	// big.Int/wei: amount is already wei — the L1 tx value equals it verbatim.
-	unsigned := BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amount)
+	unsigned := BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, l1Value)
 	sighash := ComputeSighash(unsigned)
 
 	if err := requireTssKey(); err != nil {
@@ -241,31 +254,14 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	}
 	sdk.TssSignKey("primary", sighash)
 
-	if !DecBalance(caller, "eth", totalDeduct) {
+	if !DecBalance(caller, "eth", userDebit) {
 		return "", ce.NewContractError(ce.ErrBalance, "insufficient balance")
 	}
-	// review2 #76: the user balance was debited totalDeduct (amount+fee)
-	// but TrackWithdrawal only reduced supply by `amount`, so Supply.User
-	// drifted above the true sum of user balances by `fee` every
-	// withdrawal. Reduce User by the full debit, Active by the bridged
-	// amount, and book the fee as protocol Fee so the invariant
-	// Supply.User == Σ user balances holds.
-	{
-		s := GetSupply("eth")
-		s.Active.Sub(s.Active, amount)
-		if s.Active.Sign() < 0 {
-			s.Active.SetInt64(0)
-		}
-		s.User.Sub(s.User, totalDeduct)
-		if s.User.Sign() < 0 {
-			s.User.SetInt64(0)
-		}
-		s.Fee.Add(s.Fee, new(big.Int).Sub(totalDeduct, amount))
-		SetSupply("eth", s)
-	}
-	// (review6 M11 dropped here: the inline review2 #76 block above already
-	// performs the full Active/User/Fee accounting for the ETH path, so an
-	// additional TrackWithdrawal call would double-debit the supply counters.)
+	// Custody accounting: the vault will pay out l1Value + gas ≈ userDebit
+	// (gas estimated at the fee upper bound), all charged to the caller.
+	// Active and User both shrink by the full debit; the L1 fee is real
+	// custody outflow, not a Magi fee, so Supply.Fee is untouched.
+	TrackWithdrawal("eth", userDebit)
 
 	// W4 Cluster F D-F-3: snapshot CURRENT vault into VaultAtQueue. When
 	// confirmSpend lands, HandleConfirmSpend ecrecovers against this
@@ -273,13 +269,14 @@ func HandleUnmapETH(params *TransferParams, vaultAddress [20]byte, chainId uint6
 	// confirmSpend no longer orphans the pending withdrawal (HIGH #29).
 	StorePendingSpend(PendingSpend{
 		Nonce:         nonce,
-		Amount:        amount,
+		Amount:        l1Value, // the L1 tx value — returns to the vault on revert
 		From:          caller,
 		To:            params.To,
 		Asset:         "eth",
 		UnsignedTxHex: hex.EncodeToString(unsigned),
 		BlockHeight:   blocklist.GetLastHeight(),
 		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
+		GasCost:       fee, // prepaid L1 fee — refunded with Amount if the tx is proven dropped
 	})
 	SetPendingNonce(nonce + 1)
 
@@ -359,13 +356,14 @@ func HandleUnmapERC20(params *TransferParams, vaultAddress [20]byte, chainId uin
 	}
 	// ERC-20 unmap pays L1 gas out of the contract-wide gas-reserve pool
 	// (deductGasReserve below), NOT out of the user's token balance — so the
-	// per-asset supply has no fee component to debit here. (review6 M11's
-	// feeOnVault arg is dropped: main's big.Int TrackWithdrawal takes only the
-	// debited amount.)
+	// token supply is debited by the bare amount only.
 	TrackWithdrawal(tokenInfo.Symbol, amount)
 
 	// big.Int/wei: gas reserve and gas cost are both full wei — deduct directly.
+	// The reserve is ETH custody, so the spend is also booked against
+	// Active("eth"); restored via TrackReserveRestore if the tx is proven dropped.
 	deductGasReserve(gasCost)
+	TrackReserveSpend(gasCost)
 
 	// W4 Cluster F D-F-3: snapshot vault for ERC-20 path too.
 	StorePendingSpend(PendingSpend{
@@ -566,20 +564,23 @@ func HandleConfirmSpend(req *ConfirmSpendRequest, chainId uint64) error {
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
 	} else {
-		// Refund the failed withdrawal and restore supply. big.Int/wei:
-		// IncBalance cannot overflow, so balance and supply move together.
+		// Reverted receipt (status=0): the tx MINED, so the L1 gas was
+		// genuinely paid to the miner — that custody is gone. Only the tx
+		// VALUE (ps.Amount) returned to the vault; refund exactly that.
+		// The gas cost stays borne by whoever funded it: the withdrawer's
+		// prepaid fee (ETH path) or the gas reserve (ERC-20 path).
+		//
+		// Supersedes pentest EVM-C4's reserve refund here, which restored
+		// the reserve counter for gas that HAD been spent, overstating the
+		// reserve vs the real vault balance. The reserve/fee is restored
+		// only where nothing was spent — the proven-dropped path
+		// (refundDroppedWithdrawal). Reserve liveness is preserved: the
+		// deposit tax keeps funding it, and dropped-tx restores now work.
 		IncBalance(ps.From, ps.Asset, ps.Amount)
 		s := GetSupply(ps.Asset)
 		s.Active.Add(s.Active, ps.Amount)
 		s.User.Add(s.User, ps.Amount)
 		SetSupply(ps.Asset, s)
-		// Pentest finding EVM-C4: the gas reserve charged at unmap time was
-		// never refunded on a failed receipt. ~383 failed ERC-20 withdrawals
-		// would exhaust 0.05 ETH and then block ALL withdrawals. Restore the
-		// reserve (full wei) so the bridge keeps working.
-		if ps.GasCost != nil && ps.GasCost.Sign() > 0 {
-			addGasReserve(ps.GasCost)
-		}
 		DeletePendingSpend(confirmedNonce)
 		SetConfirmedNonce(confirmedNonce + 1)
 	}
@@ -912,6 +913,11 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		}
 	}
 
+	// Cheap precondition; the binding check happens against the FULL debit
+	// (amount + fee) once the fee is known, below — matching the BTC
+	// mapping contract, where the allowance must cover finalAmt incl. fees
+	// (utxo-mapping checkAndDeductBalance). Without that, a spender could
+	// spend `fee` beyond what the owner authorized.
 	allowance := GetAllowance(params.From, caller, params.Asset)
 	if allowance.Cmp(amount) < 0 {
 		return ce.NewContractError(ce.ErrBalance, "insufficient allowance")
@@ -921,7 +927,12 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	// (amount + fee) instead of just amount. Pre-fix, the ETH path
 	// computed no fee and the vault absorbed the L1 mining cost on every
 	// withdrawal. big.Int/wei: amount and fee are both full wei.
-	totalDeduct := new(big.Int).Set(amount)
+	//
+	// Same uniform shape as HandleUnmapETH: userDebit == l1Value + ethFee,
+	// with fee-on-top vs fee-netted (DeductFee) choosing where the fee sits.
+	userDebit := new(big.Int).Set(amount)
+	l1Value := new(big.Int).Set(amount)
+	ethFee := new(big.Int)
 	if params.Asset == "eth" {
 		_, feeWei, feeErr := safeGasFee(constants.ETHTransferGas, header.BaseFeePerGas, 2, gasTipCap)
 		if feeErr != nil {
@@ -939,30 +950,43 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 				return ce.NewContractError(ce.ErrTransaction, "fee exceeds max_fee")
 			}
 		}
-		if !params.DeductFee {
-			totalDeduct.Add(amount, feeWei)
+		if params.DeductFee {
+			l1Value.Sub(l1Value, feeWei)
+			if l1Value.Sign() <= 0 {
+				return ce.NewContractError(ce.ErrIntent, "amount does not cover the L1 fee")
+			}
+		} else {
+			userDebit.Add(amount, feeWei)
 		}
-		if GetBalance(params.From, "eth").Cmp(totalDeduct) < 0 {
+		ethFee = feeWei
+		if GetBalance(params.From, "eth").Cmp(userDebit) < 0 {
 			return ce.NewContractError(ce.ErrTransaction, "insufficient balance in owner account")
 		}
 	}
 
+	// Binding allowance check: the spender's authorization must cover the
+	// FULL owner debit (value + fee), same as the BTC baseline.
+	if allowance.Cmp(userDebit) < 0 {
+		return ce.NewContractError(ce.ErrBalance, "insufficient allowance for amount plus fee")
+	}
+
 	// All validation passed — now mutate state
-	if !DecBalance(params.From, params.Asset, totalDeduct) {
+	if !DecBalance(params.From, params.Asset, userDebit) {
 		return ce.NewContractError(ce.ErrBalance, "insufficient balance in owner account")
 	}
-	SetAllowance(params.From, caller, params.Asset, new(big.Int).Sub(allowance, amount))
-	TrackWithdrawal(params.Asset, amount)
+	SetAllowance(params.From, caller, params.Asset, new(big.Int).Sub(allowance, userDebit))
+	// Custody + user attribution shrink by the full debit (ETH: value + fee;
+	// ERC-20: bare amount — its gas comes from the reserve below).
+	TrackWithdrawal(params.Asset, userDebit)
 
 	nonce := GetPendingNonce()
 
 	var unsigned []byte
 	var asset string
 	var tokenAddress string
-	var deductedGas *big.Int
+	pendingGasCost := ethFee
 	if params.Asset == "eth" {
-		// big.Int/wei: amount is already wei — the L1 tx value equals it.
-		unsigned = BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, amount)
+		unsigned = BuildETHWithdrawalTx(chainId, nonce, gasTipCap, gasFeeCap, toAddr, l1Value)
 		asset = "eth"
 	} else {
 		// ERC-20: token-native units.
@@ -974,8 +998,11 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		if feeErr != nil {
 			return ce.NewContractError(ce.ErrArithmetic, "gas fee computation overflow")
 		}
+		// Reserve is ETH custody — book the spend against Active("eth");
+		// restored via TrackReserveRestore if the tx is proven dropped.
 		deductGasReserve(gasReserveFee)
-		deductedGas = gasReserveFee // wei reserve deducted; refunded on failed receipt (EVM-C4)
+		TrackReserveSpend(gasReserveFee)
+		pendingGasCost = gasReserveFee
 	}
 
 	sighash := ComputeSighash(unsigned)
@@ -984,7 +1011,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 	// W4 Cluster F D-F-3: snapshot vault for HandleUnmapFrom path.
 	StorePendingSpend(PendingSpend{
 		Nonce:         nonce,
-		Amount:        amount,
+		Amount:        l1Value, // ETH: L1 tx value (== amount for ERC-20)
 		From:          params.From,
 		To:            params.To,
 		Asset:         asset,
@@ -992,7 +1019,7 @@ func HandleUnmapFrom(params *TransferParams, vaultAddress [20]byte, chainId uint
 		UnsignedTxHex: hex.EncodeToString(unsigned),
 		BlockHeight:   blocklist.GetLastHeight(),
 		VaultAtQueue:  "0x" + hex.EncodeToString(vaultAddress[:]),
-		GasCost:       deductedGas, // wei reserve deducted; refunded on failed receipt (EVM-C4)
+		GasCost:       pendingGasCost, // prepaid fee (ETH) / reserve charge (ERC-20); restored on proven drop
 	})
 	SetPendingNonce(nonce + 1)
 	return nil
@@ -1106,6 +1133,42 @@ func HandleReplaceWithdrawal(vaultAddress [20]byte, chainId uint64) error {
 //     input entirely with `_ *string`);
 //   - assertNotPaused gate (CRIT #27);
 //   - returns error instead of mid-flow sdk.Revert.
+// refundDroppedWithdrawal makes the withdrawer whole for a PendingSpend
+// whose L1 tx has been PROVEN dropped (verifyL1ProofOfDrop passed): the tx
+// never executed, so NOTHING left custody. Shared by all three escape
+// hatches (clearNonce / expireWithdrawal / cancelMyWithdrawal).
+//
+//   - ETH: the user paid ps.Amount + ps.GasCost (L1 value + prepaid fee) at
+//     unmap — refund both, and restore Active/User by the same total.
+//   - ERC-20: the user paid ps.Amount in tokens (refund + restore token
+//     supply) and the gas reserve was charged ps.GasCost — the miner was
+//     never paid, so restore the reserve and its Active("eth") booking.
+//
+// Contrast with HandleConfirmSpend's reverted-receipt branch, where the tx
+// mined and the gas WAS paid: there only ps.Amount comes back.
+// big.Int/wei: IncBalance and the supply adds cannot overflow, so the
+// refund cannot fail and "state advanced => user was refunded" holds
+// unconditionally (review6 X2's hard-fail guard is unnecessary here).
+func refundDroppedWithdrawal(ps *PendingSpend) {
+	gasCost := new(big.Int)
+	if ps.GasCost != nil {
+		gasCost.Set(ps.GasCost)
+	}
+	refund := new(big.Int).Set(ps.Amount)
+	if ps.Asset == "eth" {
+		refund.Add(refund, gasCost)
+	}
+	IncBalance(ps.From, ps.Asset, refund)
+	sup := GetSupply(ps.Asset)
+	sup.Active.Add(sup.Active, refund)
+	sup.User.Add(sup.User, refund)
+	SetSupply(ps.Asset, sup)
+	if ps.Asset != "eth" && gasCost.Sign() > 0 {
+		addGasReserve(gasCost)
+		TrackReserveRestore(gasCost)
+	}
+}
+
 func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop) error {
 	if isPaused() {
 		return ce.NewContractError(ce.ErrInitialization, "contract is paused")
@@ -1134,17 +1197,8 @@ func HandleClearNonce(vaultAddress [20]byte, chainId uint64, proof L1ProofOfDrop
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// Refund + advance. big.Int/wei: IncBalance always succeeds (no overflow),
-	// so the supply restore mirrors the credit unconditionally.
-	// (Supersedes review6 X2/L2 — the hard-fail-on-overflow guard only
-	// mattered for int64 balances/accumulators; with big.Int the refund
-	// cannot fail, so the invariant "state advanced => user was refunded"
-	// holds unconditionally.)
-	IncBalance(ps.From, ps.Asset, ps.Amount)
-	sup := GetSupply(ps.Asset)
-	sup.Active.Add(sup.Active, ps.Amount)
-	sup.User.Add(sup.User, ps.Amount)
-	SetSupply(ps.Asset, sup)
+	// Proven-dropped refund: full make-whole (value + prepaid fee / reserve).
+	refundDroppedWithdrawal(ps)
 	// bug #8: NonceAdvance re-reads the PendingSpend and no-ops once it's
 	// deleted, so advance BEFORE DeletePendingSpend (race-safe vs HandleExpireWithdrawal).
 	NonceAdvance(ps, 1)
@@ -1216,14 +1270,8 @@ func HandleExpireWithdrawal(nonce uint64, proof L1ProofOfDrop, chainId uint64) e
 		return errors.New("L1ProofOfDrop verify failed: " + err.Error())
 	}
 
-	// Refund + advance. big.Int/wei: additions cannot overflow.
-	// (Supersedes review6 X2 — with big.Int the refund cannot fail, so the
-	// hard-fail-on-overflow guard is structurally unnecessary.)
-	IncBalance(ps.From, ps.Asset, ps.Amount)
-	sup := GetSupply(ps.Asset)
-	sup.Active.Add(sup.Active, ps.Amount)
-	sup.User.Add(sup.User, ps.Amount)
-	SetSupply(ps.Asset, sup)
+	// Proven-dropped refund: full make-whole (value + prepaid fee / reserve).
+	refundDroppedWithdrawal(ps)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
@@ -1262,14 +1310,8 @@ func HandleCancelMyWithdrawal(nonce uint64, proof L1ProofOfDrop, vaultAddress [2
 	sighash := ComputeSighash(unsigned)
 	sdk.TssSignKey("primary", sighash)
 
-	// (Supersedes review6 X2/L2 — big.Int supply accumulators cannot overflow,
-	// so the hard-fail guard is unnecessary; IncBalance always succeeds and
-	// "state advanced => user was refunded" holds unconditionally.)
-	IncBalance(ps.From, ps.Asset, ps.Amount)
-	sup := GetSupply(ps.Asset)
-	sup.Active.Add(sup.Active, ps.Amount)
-	sup.User.Add(sup.User, ps.Amount)
-	SetSupply(ps.Asset, sup)
+	// Proven-dropped refund: full make-whole (value + prepaid fee / reserve).
+	refundDroppedWithdrawal(ps)
 	// bug #8: advance BEFORE delete (NonceAdvance no-ops once PendingSpend gone).
 	NonceAdvance(ps, 1)
 	SetPendingNonce(GetConfirmedNonce())
