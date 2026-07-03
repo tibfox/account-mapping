@@ -72,7 +72,7 @@ const (
 // Per W4 §D-C-8 17-handler migration table:
 //   Fund-affecting (Long, 400K):     setVault, setVerifierContract, createKey, renewKey
 //   Operator-tactical (28.8K, 24h):  registerPublicKey, replaceWithdrawal, clearNonce
-//   Operational (7.2K, 6h):          registerToken, registerRouter, setGasReserve,
+//   Operational (7.2K, 6h):          registerToken, registerRouter,
 //                                     registerRelayer, deregisterRelayer,
 //                                     clearTestnetState (Cluster E coord)
 //   Emergency (0):                   pause, unpause
@@ -87,7 +87,7 @@ func TimelockFor(action string) (uint64, error) {
 		return TimelockLong, nil
 	case "registerPublicKey", "replaceWithdrawal", "clearNonce":
 		return TimelockTactical, nil
-	case "registerToken", "registerRouter", "setGasReserve",
+	case "registerToken", "registerRouter",
 		"registerRelayer", "deregisterRelayer", "clearTestnetState":
 		return TimelockOperational, nil
 	case "pause", "unpause":

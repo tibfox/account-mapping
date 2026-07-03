@@ -494,24 +494,12 @@ func dispatchAdmin(action string, payload []byte) {
 		}
 		sdk.StateSetObject(constants.RouterContractIdKey, string(payload))
 
-	case "setGasReserve":
-		assertNotPaused()
-		// MED-22 (M18-D21), ported to develop's wei model: setGasReserve
-		// previously stored the raw payload string. getGasReserve (handlers.go)
-		// parses it with the error discarded, so a non-numeric or negative value
-		// silently became a 0 reserve — or, with a huge value, a phantom reserve
-		// that passes the MinGasReserve floor while the vault holds nothing.
-		// Parse + bound the value here so only a well-formed, in-range WEI integer
-		// is stored. (int64-parsed; MaxGasReserve = 1 ETH caps it far below the
-		// int64 ceiling, and getGasReserve reads the stored decimal back as wei.)
-		gr, grErr := strconv.ParseInt(string(payload), 10, 64)
-		if grErr != nil {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setGasReserve: value must be a base-10 int64"))
-		}
-		if gr < 0 || gr > constants.MaxGasReserve {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "setGasReserve: value out of range"))
-		}
-		sdk.StateSetObject(constants.GasReserveKey, strconv.FormatInt(gr, 10))
+	// setGasReserve REMOVED: the gas reserve is now funded exclusively by the
+	// proof-backed `to_reserve` native-ETH deposit instruction (and the 1% ETH
+	// deposit tax), both of which grow Active("eth") in lockstep with the
+	// reserve. A bare admin write could bump the counter without moving Active,
+	// breaking the Active == User + Fee + reserve invariant — the source of the
+	// TrackReserveSpend divergence. See mapping.HandleMap's to_reserve branch.
 
 	// review6 H2: `seedBlocks` and `setOracleAccount` cases removed. Header
 	// state is owned by the ZK verifier contract; account-mapping no longer

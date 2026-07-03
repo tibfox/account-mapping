@@ -116,11 +116,6 @@ const MaxTokenMinWithdrawal = int64(1_000_000_000_000_000)
 // the field structure.
 const MaxTokenSymbolLen = 32
 
-// MED-22 (M18-D21): sane ceiling for the operator-set gas reserve so a fat-
-// finger top-up cannot stamp an absurd reserve that later interacts with the
-// fee/refund math. 1e18 gwei = 1e9 ETH, far above any real reserve.
-const MaxGasReserve = int64(1_000_000_000_000_000_000)
-
 // Gas constants
 const ETHTransferGas = uint64(21_000)
 const ERC20TransferGas = uint64(65_000)
@@ -137,7 +132,8 @@ const MinUSDCWithdrawal = int64(10_000_000)            // 10 USDC in micro-units
 // Gas reserve
 const GasReserveDepositTaxBps = int64(100) // 1% of ETH deposits go to gas reserve
 // big.Int/wei migration: the reserve accumulator (GasReserveKey) is denominated
-// in WEI. Operators calling `setGasReserve` MUST pass wei values.
+// in WEI. It is funded only by the proof-backed `to_reserve` deposit
+// instruction and the 1% deposit tax — there is no admin write path.
 // 0.05 ETH = 50_000_000_000_000_000 wei.
 const MinGasReserve = int64(50_000_000_000_000_000) // 0.05 ETH in WEI minimum reserve
 
